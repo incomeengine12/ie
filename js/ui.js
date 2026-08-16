@@ -308,8 +308,19 @@ function showOfflineBanner(fetchTs,fetchTsEpoch){
   const b=document.getElementById('offline-banner');
   const age=relAge(fetchTs,fetchTsEpoch);
   b.textContent=`Offline -- showing cached data${fetchTs?` from ${fetchTs}${age?' ('+age+')':''}`:''}.`;
-  b.classList.add('show');
-  setTimeout(()=>b.classList.remove('show'),4500);
+  // Force a synchronous reflow before applying .show, then defer the class
+  // change itself past the browser's next two paint cycles. This banner is
+  // most likely to fire right at initial page load (a fetch falling back to
+  // cache) -- the single riskiest moment for a known iOS Safari quirk where
+  // a position:fixed element shown before the toolbar has finished its
+  // load-time collapse animation renders in the wrong place until a scroll
+  // forces Safari to reconcile it. Reported: visible only after scrolling
+  // slightly, as if uncovering hidden text, on some devices but not others.
+  void b.offsetHeight;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    b.classList.add('show');
+    setTimeout(()=>b.classList.remove('show'),4500);
+  }));
 }
 
 function _updateHeaderTop(){
