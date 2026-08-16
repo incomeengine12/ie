@@ -3,6 +3,15 @@
 // Globals used: tzPref, S, watchlist, WORKER_URL, vixThreshold
 // Dependencies: storage.js (S)
 
+// Shared by _computeRSIBacktestForTicker and _computeRSIBacktestAggregate --
+// previously defined identically (as a closure over a local `closes`) in
+// both places. Takes closes explicitly so both call sites can share it.
+function fwdReturn(closes,closeIdx,n){
+  const from=closes[closeIdx],to=closes[closeIdx+n];
+  if(from==null||to==null||from<=0)return null;
+  return(to-from)/from*100;
+}
+
 function applyFontSize(size){
   // All font sizes in this app are hardcoded in px (in app.css and inline
   // styles), so changing the root font-size has no effect on them.
@@ -489,12 +498,6 @@ function _computeRSIBacktestForTicker(ticker){
     const rsiPeriod=14;
     const rsi=computeRSI(closes,rsiPeriod); // rsi[k] corresponds to closes[k+rsiPeriod]
 
-    const fwdReturn=(closeIdx,n)=>{
-      const from=closes[closeIdx],to=closes[closeIdx+n];
-      if(from==null||to==null||from<=0)return null;
-      return(to-from)/from*100;
-    };
-
     // Detect episodes: both entering a zone (first day RSI crosses in, not
     // every day spent there) and leaving it (first day RSI crosses back out).
     // Entering measures "what happens once a stock looks stretched"; leaving
@@ -519,7 +522,7 @@ function _computeRSIBacktestForTicker(ticker){
     }
 
     const summarize=(idxList,n)=>{
-      const rets=idxList.map(idx=>fwdReturn(idx,n)).filter(r=>r!=null);
+      const rets=idxList.map(idx=>fwdReturn(closes,idx,n)).filter(r=>r!=null);
       if(!rets.length)return null;
       const avgReturn=rets.reduce((a,b)=>a+b,0)/rets.length;
       const pctPositive=rets.filter(r=>r>0).length/rets.length*100;
@@ -529,7 +532,7 @@ function _computeRSIBacktestForTicker(ticker){
     const baselineFor=(n)=>{
       const rets=[];
       for(let i=0;i<closes.length-n;i++){
-        const r=fwdReturn(i,n);
+        const r=fwdReturn(closes,i,n);
         if(r!=null)rets.push(r);
       }
       if(!rets.length)return null;
@@ -581,12 +584,6 @@ function _computeRSIBacktestAggregate(tickers){
       const rsi=computeRSI(closes,rsiPeriod);
       tickersWithData++;
 
-      const fwdReturn=(closeIdx,n)=>{
-        const from=closes[closeIdx],to=closes[closeIdx+n];
-        if(from==null||to==null||from<=0)return null;
-        return(to-from)/from*100;
-      };
-
       const idxByCat={oversoldEnter:[],oversoldExit:[],overboughtEnter:[],overboughtExit:[]};
       let wasOversold=false,wasOverbought=false;
       for(let k=0;k<rsi.length;k++){
@@ -605,10 +602,10 @@ function _computeRSIBacktestAggregate(tickers){
 
       RSI_BACKTEST_WINDOWS.forEach(n=>{
         CATEGORIES.forEach(cat=>{
-          idxByCat[cat].forEach(idx=>{const r=fwdReturn(idx,n);if(r!=null)pooled[cat][n].push(r);});
+          idxByCat[cat].forEach(idx=>{const r=fwdReturn(closes,idx,n);if(r!=null)pooled[cat][n].push(r);});
         });
         for(let i=0;i<closes.length-n;i++){
-          const r=fwdReturn(i,n);
+          const r=fwdReturn(closes,i,n);
           if(r!=null)baselinePooled[n].push(r);
         }
       });
@@ -1046,4 +1043,136 @@ function refreshDbgLogDisplay(){
   el.innerHTML = window._dbgLog.length
     ? window._dbgLog.map(l=>'<div style="border-bottom:1px solid var(--border);padding:3px 0;word-break:break-all">'+l+'</div>').join('')
     : '<div style="color:var(--text3)">No entries yet.</div>';
+}
+
+// ── Black-Scholes core (Wheel Backtest) ─────────────────────────────────────
+// Standard European option pricing, used to approximate historical premiums
+// where real historical implied-vol data isn't available (see
+// _realizedVolAsOf below for the vol input this uses instead). Standard
+// Abramowitz & Stegun approximation for the normal CDF -- accurate to
+// ~7.5e-8, the conventional choice for finance code that doesn't have
+// access to a real erf() implementation.
+function _normCDF(x){
+  const a1=0.319381530,a2=-0.356563782,a3=1.781477937,a4=-1.821255978,a5=1.330274429;
+  const absX=Math.abs(x);
+  const k=1/(1+0.2316419*absX);
+  const phi=Math.exp(-absX*absX/2)/Math.sqrt(2*Math.PI);
+  const poly=k*(a1+k*(a2+k*(a3+k*(a4+k*a5))));
+  const cdf=1-phi*poly;
+  return x>=0?cdf:1-cdf;
+}
+
+function _bsD1D2(S,K,T,r,sigma){
+  const d1=(Math.log(S/K)+(r+sigma*sigma/2)*T)/(sigma*Math.sqrt(T));
+  const d2=d1-sigma*Math.sqrt(T);
+  return{d1,d2};
+}
+
+function _bsCallPrice(S,K,T,r,sigma){
+  if(T<=0||sigma<=0)return Math.max(S-K,0);
+  const{d1,d2}=_bsD1D2(S,K,T,r,sigma);
+  return S*_normCDF(d1)-K*Math.exp(-r*T)*_normCDF(d2);
+}
+
+function _bsPutPrice(S,K,T,r,sigma){
+  if(T<=0||sigma<=0)return Math.max(K-S,0);
+  const{d1,d2}=_bsD1D2(S,K,T,r,sigma);
+  return K*Math.exp(-r*T)*_normCDF(-d2)-S*_normCDF(-d1);
+}
+
+function _bsCallDelta(S,K,T,r,sigma){
+  if(T<=0||sigma<=0)return S>K?1:0;
+  const{d1}=_bsD1D2(S,K,T,r,sigma);
+  return _normCDF(d1);
+}
+
+function _bsPutDelta(S,K,T,r,sigma){
+  if(T<=0||sigma<=0)return S<K?-1:0;
+  const{d1}=_bsD1D2(S,K,T,r,sigma);
+  return _normCDF(d1)-1;
+}
+
+// Solves for the strike matching a target delta magnitude (e.g. 0.30 for a
+// 30-delta put/call), via bisection. Delta is monotonic in K for both put
+// and call (confirmed: put delta decreases from 0 toward -1 as K rises;
+// call delta decreases from 1 toward 0 as K rises), so bisection over a
+// wide bracket is guaranteed to converge -- simpler and more robust here
+// than Newton-Raphson, and precision to a fraction of a cent in strike
+// terms is already far beyond what this approximation's other simplifying
+// assumptions (realized vol as an IV proxy, no skew) would justify anyway.
+// Finds the MOST-OTM strike that still clears a minimum annualized yield
+// floor -- a different targeting philosophy than delta-based selection.
+// Yield is a monotonically DECREASING function of how far OTM the strike
+// sits (moving away from the money always lowers premium, so always
+// lowers yield too), which means ATM (K=S) is the maximum yield
+// achievable while staying OTM-eligible -- if ATM itself can't clear the
+// floor, nothing further OTM can either (returns null, signaling
+// infeasibility at this DTE/vol combination). Otherwise bisects between
+// ATM and a deep-OTM bound to find the boundary strike where yield
+// exactly equals the floor -- the most conservative strike still
+// consistent with hitting the target.
+function _annualizedYieldPct(premium,S,T){
+  return(premium/S)*(365/(T*365))*100;
+}
+
+function _solveStrikeForYieldFloor(S,T,r,sigma,targetFloorPct,optionType){
+  const bsPriceFn=optionType==='put'?_bsPutPrice:_bsCallPrice;
+  const atmPremium=bsPriceFn(S,S,T,r,sigma);
+  const atmYield=_annualizedYieldPct(atmPremium,S,T);
+  if(atmYield<targetFloorPct)return null; // not reachable at this DTE, even at the money
+
+  let lo,hi;
+  if(optionType==='put'){lo=S*0.3;hi=S;}else{lo=S;hi=S*2.0;}
+  for(let i=0;i<60;i++){
+    const mid=(lo+hi)/2;
+    const yieldPct=_annualizedYieldPct(bsPriceFn(S,mid,T,r,sigma),S,T);
+    if(optionType==='put'){
+      if(yieldPct>=targetFloorPct)hi=mid;else lo=mid; // converge toward the smallest feasible (most OTM) K
+    }else{
+      if(yieldPct>=targetFloorPct)lo=mid;else hi=mid; // converge toward the largest feasible (most OTM) K
+    }
+  }
+  return optionType==='put'?hi:lo;
+}
+
+function _solveStrikeForDelta(S,T,r,sigma,targetDeltaAbs,optionType){
+  if(S<=0||T<=0||sigma<=0||targetDeltaAbs<=0||targetDeltaAbs>=1)return null;
+  const deltaFn=optionType==='put'
+    ?(K)=>Math.abs(_bsPutDelta(S,K,T,r,sigma))
+    :(K)=>Math.abs(_bsCallDelta(S,K,T,r,sigma));
+  // |call delta| DECREASES as K rises (deep ITM near K=0 -> near 0 as K->inf).
+  // |put delta| INCREASES as K rises (opposite direction) -- the bisection
+  // step direction must flip between the two option types accordingly.
+  let lo=S*0.1,hi=S*3.0;
+  for(let i=0;i<60;i++){
+    const mid=(lo+hi)/2;
+    const d=deltaFn(mid);
+    if(optionType==='call'){
+      if(d>targetDeltaAbs)lo=mid;else hi=mid;
+    }else{
+      if(d>targetDeltaAbs)hi=mid;else lo=mid;
+    }
+  }
+  return(lo+hi)/2;
+}
+
+// Rolling annualized realized volatility as of a specific historical index
+// only -- never looks past `idx`, which is what keeps the backtest honest
+// (a real trader on that date couldn't have known anything past it either).
+// Same log-return/stdev/sqrt(252) annualization already used and tested in
+// computeHVRSeries, just returning the raw value instead of a 0-100 rank,
+// and computed at an arbitrary point rather than as a full series.
+function _realizedVolAsOf(closes,idx,window){
+  window=window||21;
+  if(idx<window)return null;
+  const logRet=[];
+  for(let i=idx-window+1;i<=idx;i++){
+    if(closes[i]!=null&&closes[i]>0&&closes[i-1]!=null&&closes[i-1]>0){
+      logRet.push(Math.log(closes[i]/closes[i-1]));
+    }
+  }
+  if(logRet.length<window*0.8)return null;
+  const m=logRet.reduce((s,v)=>s+v,0)/logRet.length;
+  const variance=logRet.reduce((s,v)=>s+(v-m)*(v-m),0)/(logRet.length-1);
+  return Math.sqrt(variance)*Math.sqrt(252);
 }

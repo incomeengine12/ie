@@ -15,12 +15,14 @@ function setDashboardViewMode(mode){
 }
 
 function _syncDashboardViewModeUI(){
-  const putsBtn=document.getElementById('dash-view-puts'),ccBtn=document.getElementById('dash-view-cc'),rsiBtn=document.getElementById('dash-view-rsi'),riskBtn=document.getElementById('dash-view-risk'),gapBtn=document.getElementById('dash-view-gap');
+  const putsBtn=document.getElementById('dash-view-puts'),ccBtn=document.getElementById('dash-view-cc'),rsiBtn=document.getElementById('dash-view-rsi'),riskBtn=document.getElementById('dash-view-risk'),gapBtn=document.getElementById('dash-view-gap'),notesBtn=document.getElementById('dash-view-notes'),wheelbtBtn=document.getElementById('dash-view-wheelbt');
   if(putsBtn)putsBtn.style.opacity=dashboardViewMode==='puts'?'1':'0.4';
   if(ccBtn)ccBtn.style.opacity=dashboardViewMode==='cc'?'1':'0.4';
   if(rsiBtn)rsiBtn.style.opacity=dashboardViewMode==='rsi'?'1':'0.4';
   if(riskBtn)riskBtn.style.opacity=dashboardViewMode==='risk'?'1':'0.4';
   if(gapBtn)gapBtn.style.opacity=dashboardViewMode==='gap'?'1':'0.4';
+  if(notesBtn)notesBtn.style.opacity=dashboardViewMode==='notes'?'1':'0.4';
+  if(wheelbtBtn)wheelbtBtn.style.opacity=dashboardViewMode==='wheelbt'?'1':'0.4';
 
   const convictionControls=document.getElementById('dash-conviction-controls');
   const putsCard=document.getElementById('dash-puts-card');
@@ -29,17 +31,25 @@ function _syncDashboardViewModeUI(){
   const rsiRankingCard=document.getElementById('dash-rsi-ranking-card');
   const riskCard=document.getElementById('dash-risk-card');
   const gapCard=document.getElementById('dash-gap-card');
-  if(convictionControls)convictionControls.style.display=(dashboardViewMode==='rsi'||dashboardViewMode==='risk'||dashboardViewMode==='gap')?'none':'';
+  const notesCard=document.getElementById('dash-notes-card');
+  const wheelbtCard=document.getElementById('dash-wheelbt-card');
+  const wheelbtRankingCard=document.getElementById('dash-wheelbt-ranking-card');
+  if(convictionControls)convictionControls.style.display=(dashboardViewMode==='rsi'||dashboardViewMode==='risk'||dashboardViewMode==='gap'||dashboardViewMode==='notes'||dashboardViewMode==='wheelbt')?'none':'';
   if(putsCard)putsCard.style.display=dashboardViewMode==='puts'?'':'none';
   if(ccCard)ccCard.style.display=dashboardViewMode==='cc'?'':'none';
   if(rsiCard)rsiCard.style.display=dashboardViewMode==='rsi'?'':'none';
   if(rsiRankingCard)rsiRankingCard.style.display=dashboardViewMode==='rsi'?'':'none';
   if(riskCard)riskCard.style.display=dashboardViewMode==='risk'?'':'none';
   if(gapCard)gapCard.style.display=dashboardViewMode==='gap'?'':'none';
+  if(notesCard)notesCard.style.display=dashboardViewMode==='notes'?'':'none';
+  if(wheelbtCard)wheelbtCard.style.display=dashboardViewMode==='wheelbt'?'':'none';
+  if(wheelbtRankingCard)wheelbtRankingCard.style.display=dashboardViewMode==='wheelbt'?'':'none';
 
   if(dashboardViewMode==='rsi'){_populateRSIBacktestDropdown();renderRSIBacktest();renderRSIRanking();}
   if(dashboardViewMode==='risk'){renderAssignmentRisk();}
   if(dashboardViewMode==='gap'){_populateGapFillDropdown();renderGapFillDashboard();}
+  if(dashboardViewMode==='notes'){renderDashboardNotes();}
+  if(dashboardViewMode==='wheelbt'){_populateWheelBacktestDropdown();if(!_wheelbtViewEverRendered||_wheelbtDataStale)setTimeout(refreshWheelBacktestViews,50);}
 }
 
 // 9 component definitions split into two rows: 4 on top, 5 on bottom.
@@ -81,6 +91,7 @@ function renderCompBars(comps){
 
 function renderDashTable(elId,results,ts,isLive){
   const el=document.getElementById(elId);if(!results.length){el.innerHTML='<div class="empty">No data</div>';return;}
+  const starred=_starredTickers();
   el.innerHTML=results.filter(r=>r.signal!=='error').map(r=>{
     const bc=r.signal==='high'?'rgba(0,200,150,0.7)':r.signal==='medium'?'rgba(255,193,7,0.7)':'rgba(255,71,87,0.6)';
     const bg=r.signal==='high'?'rgba(0,200,150,0.12)':r.signal==='medium'?'rgba(255,193,7,0.12)':'rgba(255,71,87,0.10)';
@@ -89,9 +100,10 @@ function renderDashTable(elId,results,ts,isLive){
     const apy=r.estApy&&r.estApy!=='--'?r.estApy:null;
     const sc=r.score!=null?r.score:'';
     const comps=r.components||{};
+    const starLabel=starred.has(r.ticker)?'<span style="font-size:13px;color:#ffc107;margin-left:4px" title="Starred">&#9733;</span>':'';
     return'<div style="background:'+bg+';border:1px solid '+bc+';border-left:4px solid '+bc+';border-radius:10px;padding:12px;margin-bottom:10px;cursor:pointer" onclick="navigateToTicker(\''+r.ticker+'\')">'
       +'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">'
-      +'<div><span style="font-family:var(--sans);font-size:18px;font-weight:700;color:var(--accent)">'+r.ticker+'</span>'+(r.price?'<span style="font-family:var(--mono);font-size:13px;color:var(--text2);margin-left:8px">$'+r.price.toFixed(2)+'</span>':'')+'</div>'
+      +'<div><span style="font-family:var(--sans);font-size:18px;font-weight:700;color:var(--accent)">'+r.ticker+'</span>'+starLabel+(r.price?'<span style="font-family:var(--mono);font-size:13px;color:var(--text2);margin-left:8px">$'+r.price.toFixed(2)+'</span>':'')+'</div>'
       +'<div style="text-align:right"><div style="font-family:var(--mono);font-size:11px;font-weight:600">'+r.signal.toUpperCase()+(sc!==''?' &middot; '+sc:'')+'</div>'+(r.ivrBadge||'')+'</div>'
       +'</div>'
       +renderCompBars(comps)
@@ -505,4 +517,32 @@ function renderGapFillDashboard(){
       <div id="gap-fill-list-dash" style="max-height:180px;overflow-y:auto;">${eventsDesc.length?eventsDesc.map(e=>_gapEventRowHtml(selectedTicker,e,hist2y)).join(''):'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);padding:6px 0">No open gaps right now.</div>'}</div>
     `;
   }
+}
+
+// ── Notes view ────────────────────────────────────────────────────────────
+// Freeform, not tied to any ticker -- no length limit by design (unlike the
+// per-ticker watchlist notes, which are intentionally short). Auto-saves on
+// input with a short debounce, rather than requiring an explicit Save
+// action, since this is meant to feel like a persistent scratchpad.
+
+let _dashNotesSaveTimer=null;
+
+function renderDashboardNotes(){
+  const ta=document.getElementById('dash-notes-text');
+  if(!ta)return;
+  ta.value=S.get('dashboard_notes')||'';
+  const status=document.getElementById('dash-notes-status');
+  if(status)status.innerHTML='&nbsp;';
+}
+
+function _saveDashboardNotes(){
+  const ta=document.getElementById('dash-notes-text');
+  const status=document.getElementById('dash-notes-status');
+  if(!ta)return;
+  if(status)status.textContent='Saving...';
+  clearTimeout(_dashNotesSaveTimer);
+  _dashNotesSaveTimer=setTimeout(()=>{
+    S.set('dashboard_notes',ta.value);
+    if(status)status.textContent='Saved '+new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+  },500);
 }

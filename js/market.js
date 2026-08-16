@@ -1,5 +1,195 @@
 // ═══ MARKET TAB with T-BILL YIELDS ═══
 function _mktTimeout(p,ms,label){return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('Timeout: '+label)),ms))]);}
+let currentTBillSpan='1y'; // T-bill chart timeframe toggle (3m/6m/1y)
+// Shared by loadMarketTab (live) and _renderMarketFromCache (cached) --
+// previously defined identically in both places.
+function fmtChg(val,chg,chgPct){if(!val)return'N/A';const color=chg>=0?'var(--green)':'var(--red)';const sign=chg>=0?'+':'';return`${val.toFixed(2)} <span style="color:${color};font-size:11px">${sign}${chg?.toFixed(2)} (${sign}${chgPct?.toFixed(2)}%)</span>`;}
+
+// Shared by loadMarketTab (live) and _renderMarketFromCache (cached) --
+// previously this whole block was duplicated line-for-line in both
+// functions.
+function _computeMarketDerivedValues(sp500,nasdaq,spLivePrice,spPrevClose,nqLivePrice,nqPrevClose,tbill3m,tbill5y,tbill10y){
+  const tb3Current=tbill3m.length?tbill3m[tbill3m.length-1].value:null;
+  const tb5yCurrent=tbill5y.length?tbill5y[tbill5y.length-1].value:null;
+  const tb10yCurrent=tbill10y.length?tbill10y[tbill10y.length-1].value:null;
+  const tb3Yr=tbill3m.length>=252?tbill3m[tbill3m.length-252].value:tbill3m[0]?.value;
+  const tb5yYr=tbill5y.length>=252?tbill5y[tbill5y.length-252].value:tbill5y[0]?.value;
+  const tb10yYr=tbill10y.length>=252?tbill10y[tbill10y.length-252].value:tbill10y[0]?.value;
+
+  // Three spreads, each reading a different part of the curve. None of
+  // these are a true 3-month/6-month comparison -- there is no 6-month
+  // T-bill index available via Yahoo, so ^FVX (5Y) and ^TNX (10Y) are used
+  // as the two longer points instead, labeled honestly throughout.
+  const spread35=tb3Current&&tb5yCurrent?tb5yCurrent-tb3Current:null;
+  const spread310=tb3Current&&tb10yCurrent?tb10yCurrent-tb3Current:null;
+  const spread510=tb5yCurrent&&tb10yCurrent?tb10yCurrent-tb5yCurrent:null;
+  const spreadStr35=spread35!==null?(spread35>=0?`5Y yields ${spread35.toFixed(2)}bp above 3M (normal) -- medium-term signal`:`3M yields ${Math.abs(spread35).toFixed(2)}bp above 5Y (inverted -- market expects rate cuts) -- medium-term signal`):'';
+  const spreadStr310=spread310!==null?(spread310>=0?`10Y yields ${spread310.toFixed(2)}bp above 3M (normal) -- the classic recession-watch spread`:`3M yields ${Math.abs(spread310).toFixed(2)}bp above 10Y (inverted -- market expects rate cuts) -- the classic recession-watch spread`):'';
+  const spreadStr510=spread510!==null?(spread510>=0?`10Y yields ${spread510.toFixed(2)}bp above 5Y (normal) -- long-end slope, not near-term Fed policy`:`5Y yields ${Math.abs(spread510).toFixed(2)}bp above 10Y (inverted) -- long-end slope, not near-term Fed policy`):'';
+
+  // Income engine summary -- compare all three layers
+  const spyi_snap=S.get('snap_etf_SPYI');const nbos_snap=S.get('snap_etf_NBOS');
+  const spyi_div=S.get('div_etf_SPYI');const nbos_div=S.get('div_etf_NBOS');
+  let spyiYield=null,nbosYield=null;
+  if(spyi_snap?.price&&spyi_div?.distributions){const tot=spyi_div.distributions.slice(0,12).reduce((s,d)=>s+(d.amount||0),0);spyiYield=(tot/spyi_snap.price*100).toFixed(2);}
+  if(nbos_snap?.price&&nbos_div?.distributions){const tot=nbos_div.distributions.slice(0,12).reduce((s,d)=>s+(d.amount||0),0);nbosYield=(tot/nbos_snap.price*100).toFixed(2);}
+
+  const cv=S.get('vix_hist');const vixCurrent=cv?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
+  // Prefer live quote price; fall back to last close from history
+  const spCurrent=spLivePrice||sp500?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
+  const spPrevHist=sp500?.closes?.filter(c=>c!==null).slice(-2)[0]||null;
+  const spPrevFinal=spPrevClose||spPrevHist||null;
+  const spChg=spCurrent&&spPrevFinal?spCurrent-spPrevFinal:null;
+  const spChgPct=spChg&&spPrevFinal?spChg/spPrevFinal*100:null;
+  const nqCurrent=nqLivePrice||nasdaq?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
+  const nqPrevHist=nasdaq?.closes?.filter(c=>c!==null).slice(-2)[0]||null;
+  const nqPrevFinal=nqPrevClose||nqPrevHist||null;
+  const nqChg=nqCurrent&&nqPrevFinal?nqCurrent-nqPrevFinal:null;
+  const nqChgPct=nqChg&&nqPrevFinal?nqChg/nqPrevFinal*100:null;
+
+  const spLabels=sp500?.timestamps?.slice(-63).map(d=>{if(!(d instanceof Date))d=new Date(d);return d.toLocaleDateString('en-US',{month:'short',day:'numeric'});})||[];
+  const spData=sp500?.closes?.slice(-63)||[];
+
+  return{tb3Current,tb5yCurrent,tb10yCurrent,tb3Yr,tb5yYr,tb10yYr,spread35,spread310,spread510,spreadStr35,spreadStr310,spreadStr510,spyiYield,nbosYield,vixCurrent,spCurrent,spChg,spChgPct,nqCurrent,nqChg,nqChgPct,spLabels,spData};
+}
+
+// Shared render + chart-draw, driven by an isLive flag rather than being
+// duplicated per call site. Consumes the object _computeMarketDerivedValues
+// returns. Fixes two real bugs the duplication had let drift: the T-bill
+// card's explanatory sentence was missing from the cached-render copy, and
+// the live copy computed outlook/outlookHike but never used either --
+// dead code left over from an edit that only touched one of the two copies.
+function _renderMarketContent(el,{ts,isLive,tsEpoch,fredTs,fredTsEpoch,fedFutures,tbill3m,tbill5y,tbill10y,marketNews,derived}){
+  const{tb3Current,tb5yCurrent,tb10yCurrent,tb3Yr,tb5yYr,tb10yYr,spread35,spread310,spread510,spreadStr35,spreadStr310,spreadStr510,spyiYield,nbosYield,vixCurrent,spCurrent,spChg,spChgPct,nqCurrent,nqChg,nqChgPct,spLabels,spData}=derived;
+
+  el.innerHTML=`
+    ${tsChip(ts,isLive,tsEpoch)}
+    <!-- Income Engine Summary -->
+    <div class="card" style="border-left:4px solid var(--accent3)">
+      <div class="card-title"><span class="dot" style="background:var(--accent3)"></span>Income Engine Summary</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px">Your three-layer income strategy -- risk premium above risk-free rate at each layer</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(33,150,243,0.1);border-radius:8px;border:1px solid rgba(33,150,243,0.3)">
+          <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 1 -- T-BILLS</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">3-month Treasury</div></div>
+          <div style="font-family:var(--mono);font-size:20px;font-weight:600;color:#64b5f6">${tb3Current?tb3Current.toFixed(2)+'%':'N/A'}</div>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(255,107,53,0.1);border-radius:8px;border:1px solid rgba(255,107,53,0.3)">
+          <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 2 -- ETFs</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">SPYI / NBOS TTM Yield</div></div>
+          <div style="text-align:right">
+            <div style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--accent2)">${spyiYield?'SPYI '+spyiYield+'%':'SPYI --'}${tb3Current&&spyiYield?' (+'+((parseFloat(spyiYield)-tb3Current).toFixed(2))+'% vs T-bills)':''}</div>
+            <div style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--accent2);margin-top:2px">${nbosYield?'NBOS '+nbosYield+'%':'NBOS --'}${tb3Current&&nbosYield?' (+'+((parseFloat(nbosYield)-tb3Current).toFixed(2))+'% vs T-bills)':''}</div>
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(0,212,170,0.1);border-radius:8px;border:1px solid rgba(0,212,170,0.3)">
+          <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 3 -- WHEEL</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">Active put/call selling target</div></div>
+          <div style="text-align:right"><div style="font-family:var(--mono);font-size:20px;font-weight:600;color:var(--accent)">${(parseFloat(document.getElementById('target-apy')?.value)||12).toFixed(1)}%</div><div style="font-family:var(--mono);font-size:9px;color:var(--text3)">${tb3Current?`+${((parseFloat(document.getElementById('target-apy')?.value)||12)-tb3Current).toFixed(2)}% risk premium`:'target APY (set on Dashboard tab)'}</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- T-bill yields -->
+    ${(()=>{
+      // CME Fed Funds Futures -- implied rate path
+      if(!fedFutures||!fedFutures.length)return'';
+      const firstRate=fedFutures[0]?.impliedRate;
+      const lastRate=fedFutures[fedFutures.length-1]?.impliedRate;
+      // Compute cumulative cut/hike vs first contract
+      const rows=fedFutures.map((c,i)=>{
+        const delta=i===0?0:parseFloat((c.impliedRate-fedFutures[0].impliedRate).toFixed(3));
+        const bps=Math.round(delta*100);
+        const col=bps<-5?'var(--green)':bps>5?'var(--red)':'var(--text2)';
+        const sign=bps>0?'+':'';
+        return '<tr>'
+          +'<td style="color:var(--text2)">'+c.month+'</td>'
+          +'<td style="font-family:var(--mono)">'+c.price.toFixed(3)+'</td>'
+          +'<td style="font-family:var(--mono)">'+c.impliedRate.toFixed(3)+'%</td>'
+          +'<td style="color:'+col+';font-family:var(--mono)">'+(i===0?'—':sign+bps+'bp')+'</td>'
+          +'</tr>';
+      }).join('');
+      const totalBps=Math.round((lastRate-firstRate)*100);
+      const outlookFlat=Math.abs(totalBps)<25?'Markets pricing no change':'';
+      const outlookMild=totalBps<=-25&&totalBps>-50?'Markets pricing ~1 cut':'';
+      const summary=outlookFlat||outlookMild||(totalBps<=-50?'Markets pricing 2+ cuts':'Markets pricing 1-2 cuts');
+      return '<div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Fed Funds Futures (CME Implied Rates)</div>'
+        +'<div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:8px">30-day futures price → implied rate (100 − price). Delta vs near-month contract.</div>'
+        +'<div class="options-table-wrap"><table class="options-table">'
+        +'<thead><tr><th style="text-align:left">Month</th><th>Price</th><th>Implied Rate</th><th>Δ vs Now</th></tr></thead>'
+        +'<tbody>'+rows+'</tbody></table></div>'
+        +'<div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:8px">'+summary+' (next '+fedFutures.length+' months, '+Math.abs(totalBps)+'bp total)</div>'
+        +'</div>';
+    })()}
+    <div class="card">
+      <div class="card-title"><span class="dot" style="background:#64b5f6"></span>Treasury Yields (^IRX / ^FVX / ^TNX)</div>
+      ${tsChip(fredTs,isLive,fredTsEpoch)}
+      <div class="metrics-grid">
+        <div class="metric-tile"><div class="metric-label">3-Month T-Bill (^IRX)</div><div class="metric-value" style="color:#64b5f6">${tb3Current?tb3Current.toFixed(3)+'%':'N/A'}</div><div class="metric-sub">${tb3Yr?`1Y ago: ${tb3Yr.toFixed(3)}% (${(tb3Current-tb3Yr)>=0?'+':''}${(tb3Current-tb3Yr).toFixed(3)}%)`:''}</div></div>
+        <div class="metric-tile"><div class="metric-label">5-Year Treasury (^FVX)</div><div class="metric-value" style="color:#64b5f6">${tb5yCurrent?tb5yCurrent.toFixed(3)+'%':'N/A'}</div><div class="metric-sub">${tb5yYr?`1Y ago: ${tb5yYr.toFixed(3)}% (${(tb5yCurrent-tb5yYr)>=0?'+':''}${(tb5yCurrent-tb5yYr).toFixed(3)}%)`:''}</div></div>
+        <div class="metric-tile"><div class="metric-label">10-Year Treasury (^TNX)</div><div class="metric-value" style="color:#64b5f6">${tb10yCurrent?tb10yCurrent.toFixed(3)+'%':'N/A'}</div><div class="metric-sub">${tb10yYr?`1Y ago: ${tb10yYr.toFixed(3)}% (${(tb10yCurrent-tb10yYr)>=0?'+':''}${(tb10yCurrent-tb10yYr).toFixed(3)}%)`:''}</div></div>
+        ${spread35!==null?`<div class="metric-tile" style="grid-column:span 2"><div class="metric-label">3M / 5Y Spread</div><div class="metric-value" style="font-size:13px">${Math.abs(spread35).toFixed(2)}bp ${spread35>=0?'(5Y > 3M)':'(3M > 5Y -- inverted)'}</div><div class="metric-sub">${spreadStr35}</div></div>`:''}
+        ${spread310!==null?`<div class="metric-tile" style="grid-column:span 2"><div class="metric-label">3M / 10Y Spread</div><div class="metric-value" style="font-size:13px">${Math.abs(spread310).toFixed(2)}bp ${spread310>=0?'(10Y > 3M)':'(3M > 10Y -- inverted)'}</div><div class="metric-sub">${spreadStr310}</div></div>`:''}
+        ${spread510!==null?`<div class="metric-tile" style="grid-column:span 2"><div class="metric-label">5Y / 10Y Spread</div><div class="metric-value" style="font-size:13px">${Math.abs(spread510).toFixed(2)}bp ${spread510>=0?'(10Y > 5Y)':'(5Y > 10Y -- inverted)'}</div><div class="metric-sub">${spreadStr510}</div></div>`:''}
+      </div>
+      ${tbill3m&&tbill3m.length?`<div style="display:flex;gap:6px;margin:10px 0 4px"><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:${currentTBillSpan==='3m'?'1':'0.4'}" id="tbill-btn-3m" onclick="toggleTBillSpan('3m')">3M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:${currentTBillSpan==='6m'?'1':'0.4'}" id="tbill-btn-6m" onclick="toggleTBillSpan('6m')">6M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:${currentTBillSpan==='1y'?'1':'0.4'}" id="tbill-btn-1y" onclick="toggleTBillSpan('1y')">1Y</button></div><div class="chart-wrap" style="height:160px"><canvas id="tbill-chart"></canvas></div><div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:4px">History of 3-month T-bill (blue, ^IRX), 5-Year Treasury (orange, ^FVX), and 10-Year Treasury (purple, ^TNX) yields. No 6-month T-bill index is available via this data source. Source: Yahoo Finance via Cloudflare Worker. Spreads above read curve shape at different horizons -- 3M/10Y is the standard recession-watch spread; 5Y/10Y reads the long end alone.</div>`:''}
+    </div>
+    <!-- Market indices -->
+    <div class="metrics-grid">
+      <div class="metric-tile" style="grid-column:span 2"><div class="metric-label">S&P 500</div><div class="metric-value" style="font-size:15px">${fmtChg(spCurrent,spChg,spChgPct)}</div></div>
+      <div class="metric-tile" style="grid-column:span 2"><div class="metric-label">Nasdaq Composite</div><div class="metric-value" style="font-size:15px">${fmtChg(nqCurrent,nqChg,nqChgPct)}</div></div>
+      ${vixCurrent?`<div class="metric-tile" style="grid-column:span 2;background:${vixCurrent>=30?'rgba(255,71,87,0.1)':vixCurrent>=20?'rgba(255,165,2,0.1)':'var(--surface2)'}"><div class="metric-label">VIX (from cache)</div><div class="metric-value" style="color:${vixCurrent>=30?'var(--red)':vixCurrent>=20?'var(--warn)':'var(--text)'}">${vixCurrent.toFixed(2)}</div><div class="metric-sub">${vixCurrent>=30?'FEAR SPIKE -- exceptional premium':vixCurrent>=20?'ELEVATED -- favorable for selling':'Normal conditions'}</div></div>`:''}
+    </div>
+    ${spLabels.length?`<div class="card"><div class="card-title"><span class="dot" style="background:#4fc3f7"></span>S&P 500 (3 months)</div><div class="chart-wrap" style="height:180px"><canvas id="sp500-chart"></canvas></div></div>`:''}
+    <div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Top Market News</div><div>${renderNewsItems(marketNews,10)}</div></div>`;
+
+  // Render charts
+  setTimeout(()=>{
+    const ctx=document.getElementById('sp500-chart')?.getContext('2d');
+    if(ctx&&spLabels.length){new Chart(ctx,{type:'line',data:{labels:spLabels,datasets:[{data:spData,borderColor:'#4fc3f7',borderWidth:1.5,pointRadius:0,tension:0.2,fill:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#555870',font:{size:9},maxTicksLimit:6},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9}},grid:{color:'#2a2e38'}}}}});}
+    // T-bill/Treasury chart -- data is daily (^IRX/^FVX/^TNX via
+    // yahooHistory 1y/1d), not weekly. Slicing must be in trading-day
+    // counts, matching the 252-day convention already used for the "1Y
+    // ago" comparison above -- the old slice(-52) assumed weekly auctions
+    // and only ever showed ~10 weeks.
+    window._mktTBillData={tbill3m,tbill5y,tbill10y};
+    _drawTBillChart(tbill3m,tbill5y,tbill10y,currentTBillSpan);
+  },100);
+}
+
+function _tbillSpanDays(span){return span==='3m'?63:span==='6m'?126:252;}
+
+// Shared by the initial render and toggleTBillSpan -- redraws only the
+// T-bill canvas, without re-rendering the whole card, so toggling doesn't
+// need a network round-trip (a full year of daily data is already fetched).
+function _drawTBillChart(tbill3m,tbill5y,tbill10y,span){
+  const tbCtx=document.getElementById('tbill-chart')?.getContext('2d');
+  if(!tbCtx||!tbill3m.length)return;
+  if(window._tbillChart){window._tbillChart.destroy();window._tbillChart=null;}
+  const n=_tbillSpanDays(span);
+  const recent3m=tbill3m.slice(-n);
+  const recent5y=(tbill5y||[]).slice(-n);
+  const recent10y=(tbill10y||[]).slice(-n);
+  const chartLabels=recent3m.map(d=>d.date.slice(5)); // MM-DD
+  // Align 5Y/10Y series to the same date range/length as the 3M series --
+  // defensive against a stale cache read where one series is shorter or
+  // empty (e.g. right after this build's cache-key rename).
+  const aligned5y=recent5y.slice(-recent3m.length).map(d=>d.value);
+  const aligned10y=recent10y.slice(-recent3m.length).map(d=>d.value);
+  window._tbillChart=new Chart(tbCtx,{type:'line',data:{labels:chartLabels,datasets:[
+    {label:'3-Month T-bill',data:recent3m.map(d=>d.value),borderColor:'#64b5f6',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false},
+    {label:'5-Year Treasury',data:aligned5y,borderColor:'#ff9800',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false},
+    {label:'10-Year Treasury',data:aligned10y,borderColor:'#ab47bc',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false}
+  ]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b8fa8',font:{size:9}}}},scales:{x:{ticks:{color:'#555870',font:{size:9},maxTicksLimit:8},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9},callback:v=>v.toFixed(2)+'%'},grid:{color:'#2a2e38'}}}}});
+}
+
+function toggleTBillSpan(span){
+  currentTBillSpan=span;
+  const btn3=document.getElementById('tbill-btn-3m');
+  const btn6=document.getElementById('tbill-btn-6m');
+  const btn1=document.getElementById('tbill-btn-1y');
+  if(btn3)btn3.style.opacity=span==='3m'?'1':'0.4';
+  if(btn6)btn6.style.opacity=span==='6m'?'1':'0.4';
+  if(btn1)btn1.style.opacity=span==='1y'?'1':'0.4';
+  const data=window._mktTBillData;
+  if(data)_drawTBillChart(data.tbill3m,data.tbill5y,data.tbill10y,span);
+}
 
 async function loadMarketTab(){
   if(offlineMode){await restoreMarketFromCache();return;}
@@ -66,151 +256,25 @@ async function loadMarketTab(){
     try{fedFutures=await _mktTimeout(fetchFedFundsFutures(),12000,'fed futures');if(fedFutures)S.set('fed_futures',{data:fedFutures,ts:mktTs,tsEpoch:mktTsEpoch});}
     catch{}
     if(!fedFutures){const cf=S.get('fed_futures');if(cf)fedFutures=cf.data;}
-    // T-bill yields from US Treasury FiscalData API (via Worker, no key needed)
-    let tbill3m=[],tbill6m=[],fredTs=nowPT(),fredTsEpoch=Date.now();
+    // Treasury yields via Yahoo Finance (^IRX/^FVX/^TNX), routed through
+    // the Worker. Previously this comment referenced Treasury FiscalData --
+    // that was abandoned for SSL failures on Cloudflare Workers; Yahoo has
+    // been the actual source since v1.7.3.
+    let tbill3m=[],tbill5y=[],tbill10y=[],fredTs=nowPT(),fredTsEpoch=Date.now();
     try{
       const tbills=await _mktTimeout(fetchTBills(),12000,'tbills');
-      tbill3m=tbills.tbill3m;tbill6m=tbills.tbill6m;
+      tbill3m=tbills.tbill3m;tbill5y=tbills.tbill5y;tbill10y=tbills.tbill10y;
       fredTs=nowPT();fredTsEpoch=Date.now();
-      S.set('tbills_cache',{tbill3m,tbill6m,ts:fredTs,tsEpoch:fredTsEpoch});
+      S.set('tbills_cache',{tbill3m,tbill5y,tbill10y,ts:fredTs,tsEpoch:fredTsEpoch});
     }catch{
       const cd=S.get('tbills_cache');
-      if(cd){tbill3m=cd.tbill3m||[];tbill6m=cd.tbill6m||[];fredTs=cd.ts||'';fredTsEpoch=cd.tsEpoch;}
+      if(cd){tbill3m=cd.tbill3m||[];tbill5y=cd.tbill5y||[];tbill10y=cd.tbill10y||[];fredTs=cd.ts||'';fredTsEpoch=cd.tsEpoch;}
     }
-
-    const tb3Current=tbill3m.length?tbill3m[tbill3m.length-1].value:null;
-    const tb6Current=tbill6m.length?tbill6m[tbill6m.length-1].value:null;
-    const tb3Yr=tbill3m.length>=252?tbill3m[tbill3m.length-252].value:tbill3m[0]?.value;
-    const tb6Yr=tbill6m.length>=252?tbill6m[tbill6m.length-252].value:tbill6m[0]?.value;
-    const spread=tb3Current&&tb6Current?tb6Current-tb3Current:null;
-    const spreadStr=spread!==null?(spread>=0?`6M yields ${spread.toFixed(2)}bp above 3M (normal)`:`3M yields ${Math.abs(spread).toFixed(2)}bp above 6M (inverted -- market expects rate cuts)`):'';
-
-    // Income engine summary -- compare all three layers
-    const spyi_snap=S.get('snap_etf_SPYI');const nbos_snap=S.get('snap_etf_NBOS');
-    const spyi_div=S.get('div_etf_SPYI');const nbos_div=S.get('div_etf_NBOS');
-    let spyiYield=null,nbosYield=null;
-    if(spyi_snap?.price&&spyi_div?.distributions){const tot=spyi_div.distributions.slice(0,12).reduce((s,d)=>s+(d.amount||0),0);spyiYield=(tot/spyi_snap.price*100).toFixed(2);}
-    if(nbos_snap?.price&&nbos_div?.distributions){const tot=nbos_div.distributions.slice(0,12).reduce((s,d)=>s+(d.amount||0),0);nbosYield=(tot/nbos_snap.price*100).toFixed(2);}
-
-    const cv=S.get('vix_hist');const vixCurrent=cv?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
-    // Prefer live quote price; fall back to last close from history
-    const spCurrent=spLivePrice||sp500?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
-    const spPrevHist=sp500?.closes?.filter(c=>c!==null).slice(-2)[0]||null;
-    const spPrevFinal=spPrevClose||spPrevHist||null;
-    const spChg=spCurrent&&spPrevFinal?spCurrent-spPrevFinal:null;
-    const spChgPct=spChg&&spPrevFinal?spChg/spPrevFinal*100:null;
-    const nqCurrent=nqLivePrice||nasdaq?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
-    const nqPrevHist=nasdaq?.closes?.filter(c=>c!==null).slice(-2)[0]||null;
-    const nqPrevFinal=nqPrevClose||nqPrevHist||null;
-    const nqChg=nqCurrent&&nqPrevFinal?nqCurrent-nqPrevFinal:null;
-    const nqChgPct=nqChg&&nqPrevFinal?nqChg/nqPrevFinal*100:null;
-    function fmtChg(val,chg,chgPct){if(!val)return'N/A';const color=chg>=0?'var(--green)':'var(--red)';const sign=chg>=0?'+':'';return`${val.toFixed(2)} <span style="color:${color};font-size:11px">${sign}${chg?.toFixed(2)} (${sign}${chgPct?.toFixed(2)}%)</span>`;}
-
-    // 1Y T-bill chart data
-    // tbill3m and tbill6m arrays contain ~52 weekly auctions each
 
     let marketNews=await _fetchMarketNews();
 
-    const spLabels=sp500?.timestamps?.slice(-63).map(d=>{if(!(d instanceof Date))d=new Date(d);return d.toLocaleDateString('en-US',{month:'short',day:'numeric'});})||[];
-    const spData=sp500?.closes?.slice(-63)||[];
-
-    el.innerHTML=`
-      ${tsChip(mktTs,isLive,mktTsEpoch)}
-      <!-- Income Engine Summary -->
-      <div class="card" style="border-left:4px solid var(--accent3)">
-        <div class="card-title"><span class="dot" style="background:var(--accent3)"></span>Income Engine Summary</div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px">Your three-layer income strategy -- risk premium above risk-free rate at each layer</div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(33,150,243,0.1);border-radius:8px;border:1px solid rgba(33,150,243,0.3)">
-            <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 1 -- T-BILLS</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">3-month Treasury</div></div>
-            <div style="font-family:var(--mono);font-size:20px;font-weight:600;color:#64b5f6">${tb3Current?tb3Current.toFixed(2)+'%':'N/A'}</div>
-          </div>
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(255,107,53,0.1);border-radius:8px;border:1px solid rgba(255,107,53,0.3)">
-            <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 2 -- ETFs</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">SPYI / NBOS TTM Yield</div></div>
-            <div style="text-align:right">
-              <div style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--accent2)">${spyiYield?'SPYI '+spyiYield+'%':'SPYI --'}${tb3Current&&spyiYield?' (+'+((parseFloat(spyiYield)-tb3Current).toFixed(2))+'% vs T-bills)':''}</div>
-              <div style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--accent2);margin-top:2px">${nbosYield?'NBOS '+nbosYield+'%':'NBOS --'}${tb3Current&&nbosYield?' (+'+((parseFloat(nbosYield)-tb3Current).toFixed(2))+'% vs T-bills)':''}</div>
-            </div>
-          </div>
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(0,212,170,0.1);border-radius:8px;border:1px solid rgba(0,212,170,0.3)">
-            <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 3 -- WHEEL</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">Active put/call selling target</div></div>
-            <div style="text-align:right"><div style="font-family:var(--mono);font-size:20px;font-weight:600;color:var(--accent)">${(parseFloat(document.getElementById('target-apy')?.value)||12).toFixed(1)}%</div><div style="font-family:var(--mono);font-size:9px;color:var(--text3)">${tb3Current?`+${((parseFloat(document.getElementById('target-apy')?.value)||12)-tb3Current).toFixed(2)}% risk premium`:'target APY (set on Dashboard tab)'}</div></div>
-          </div>
-        </div>
-      </div>
-      <!-- T-bill yields -->
-      ${(()=>{
-        // CME Fed Funds Futures -- implied rate path
-        if(!fedFutures||!fedFutures.length)return'';
-        const firstRate=fedFutures[0]?.impliedRate;
-        const lastRate=fedFutures[fedFutures.length-1]?.impliedRate;
-        // Compute cumulative cut/hike vs first contract
-        const rows=fedFutures.map((c,i)=>{
-          const delta=i===0?0:parseFloat((c.impliedRate-fedFutures[0].impliedRate).toFixed(3));
-          const bps=Math.round(delta*100);
-          const col=bps<-5?'var(--green)':bps>5?'var(--red)':'var(--text2)';
-          const sign=bps>0?'+':'';
-          return '<tr>'
-            +'<td style="color:var(--text2)">'+c.month+'</td>'
-            +'<td style="font-family:var(--mono)">'+c.price.toFixed(3)+'</td>'
-            +'<td style="font-family:var(--mono)">'+c.impliedRate.toFixed(3)+'%</td>'
-            +'<td style="color:'+col+';font-family:var(--mono)">'+(i===0?'—':sign+bps+'bp')+'</td>'
-            +'</tr>';
-        }).join('');
-        const totalBps=Math.round((lastRate-firstRate)*100);
-        const outlook=totalBps<=-50?'Markets pricing 2+ cuts':'Markets pricing 1-2 cuts over this window';
-        const outlookMild=totalBps<=-25&&totalBps>-50?'Markets pricing ~1 cut':'';
-        const outlookFlat=Math.abs(totalBps)<25?'Markets pricing no change':'';
-        const outlookHike=totalBps>=25?'Markets pricing rate hike':'';
-        const summary=outlookFlat||outlookMild||(totalBps<=-50?'Markets pricing 2+ cuts':'Markets pricing 1-2 cuts');
-        return '<div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Fed Funds Futures (CME Implied Rates)</div>'
-          +'<div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:8px">30-day futures price → implied rate (100 − price). Delta vs near-month contract.</div>'
-          +'<div class="options-table-wrap"><table class="options-table">'
-          +'<thead><tr><th style="text-align:left">Month</th><th>Price</th><th>Implied Rate</th><th>Δ vs Now</th></tr></thead>'
-          +'<tbody>'+rows+'</tbody></table></div>'
-          +'<div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:8px">'+summary+' (next '+fedFutures.length+' months, '+Math.abs(totalBps)+'bp total)</div>'
-          +'</div>';
-      })()}
-      <div class="card">
-        <div class="card-title"><span class="dot" style="background:#64b5f6"></span>T-Bill Yields (^IRX / ^FVX)</div>
-        ${tsChip(fredTs,isLive,fredTsEpoch)}
-        <div class="metrics-grid">
-          <div class="metric-tile"><div class="metric-label">3-Month T-Bill (^IRX)</div><div class="metric-value" style="color:#64b5f6">${tb3Current?tb3Current.toFixed(3)+'%':'N/A'}</div><div class="metric-sub">${tb3Yr?`1Y ago: ${tb3Yr.toFixed(3)}% (${(tb3Current-tb3Yr)>=0?'+':''}${(tb3Current-tb3Yr).toFixed(3)}%)`:''}</div></div>
-          <div class="metric-tile"><div class="metric-label">5-Year Treasury (^FVX)</div><div class="metric-value" style="color:#64b5f6">${tb6Current?tb6Current.toFixed(3)+'%':'N/A'}</div><div class="metric-sub">${tb6Yr?`1Y ago: ${tb6Yr.toFixed(3)}% (${(tb6Current-tb6Yr)>=0?'+':''}${(tb6Current-tb6Yr).toFixed(3)}%)`:''}</div></div>
-          ${spread!==null?`<div class="metric-tile" style="grid-column:span 2"><div class="metric-label">3M / 6M Spread</div><div class="metric-value" style="font-size:13px">${Math.abs(spread).toFixed(2)}bp ${spread>=0?'(6M > 3M)':'(3M > 6M -- inverted)'}</div><div class="metric-sub">${spreadStr}</div></div>`:''}
-        </div>
-        ${tbill3m&&tbill3m.length?`<div class="chart-wrap" style="height:160px"><canvas id="tbill-chart"></canvas></div><div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:4px">52-week history of 3-month (blue) and 6-month (orange) T-bill auction rates. Source: Yahoo Finance (^IRX, ^FVX) via Cloudflare Worker. When lines converge or cross (inversion), market is pricing in Federal Reserve rate cuts ahead.</div>`:''}
-      </div>
-      <!-- Market indices -->
-      <div class="metrics-grid">
-        <div class="metric-tile" style="grid-column:span 2"><div class="metric-label">S&P 500</div><div class="metric-value" style="font-size:15px">${fmtChg(spCurrent,spChg,spChgPct)}</div></div>
-        <div class="metric-tile" style="grid-column:span 2"><div class="metric-label">Nasdaq Composite</div><div class="metric-value" style="font-size:15px">${fmtChg(nqCurrent,nqChg,nqChgPct)}</div></div>
-        ${vixCurrent?`<div class="metric-tile" style="grid-column:span 2;background:${vixCurrent>=30?'rgba(255,71,87,0.1)':vixCurrent>=20?'rgba(255,165,2,0.1)':'var(--surface2)'}"><div class="metric-label">VIX (from cache)</div><div class="metric-value" style="color:${vixCurrent>=30?'var(--red)':vixCurrent>=20?'var(--warn)':'var(--text)'}">${vixCurrent.toFixed(2)}</div><div class="metric-sub">${vixCurrent>=30?'FEAR SPIKE -- exceptional premium':vixCurrent>=20?'ELEVATED -- favorable for selling':'Normal conditions'}</div></div>`:''}
-      </div>
-      ${spLabels.length?`<div class="card"><div class="card-title"><span class="dot" style="background:#4fc3f7"></span>S&P 500 (3 months)</div><div class="chart-wrap" style="height:180px"><canvas id="sp500-chart"></canvas></div></div>`:''}
-      <div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Top Market News</div><div>${renderNewsItems(marketNews,10)}</div></div>`;
-
-    // Render S&P 500 chart
-    setTimeout(()=>{
-      const ctx=document.getElementById('sp500-chart')?.getContext('2d');
-      if(ctx&&spLabels.length){new Chart(ctx,{type:'line',data:{labels:spLabels,datasets:[{data:spData,borderColor:'#4fc3f7',borderWidth:1.5,pointRadius:0,tension:0.2,fill:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#555870',font:{size:9},maxTicksLimit:6},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9}},grid:{color:'#2a2e38'}}}}});}
-      // T-bill chart -- Treasury auction data, weekly frequency
-      const tbCtx=document.getElementById('tbill-chart')?.getContext('2d');
-      if(tbCtx&&tbill3m.length){
-        // Use last 52 weekly auctions (~1 year) for chart
-        const last52_3m=tbill3m.slice(-52);
-        const last52_6m=tbill6m.slice(-52);
-        // Build unified label set from 3M dates (auctions every week)
-        const chartLabels=last52_3m.map(d=>d.date.slice(5)); // MM-DD
-        // Align 6M data to same date range (6M auctions are also weekly)
-        const len52=last52_3m.length;
-        const aligned6m=last52_6m.slice(-len52).map(d=>d.value);
-        new Chart(tbCtx,{type:'line',data:{labels:chartLabels,datasets:[
-          {label:'3-Month T-bill',data:last52_3m.map(d=>d.value),borderColor:'#64b5f6',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false},
-          {label:'6-Month T-bill',data:aligned6m,borderColor:'#ff9800',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false}
-        ]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b8fa8',font:{size:9}}}},scales:{x:{ticks:{color:'#555870',font:{size:9},maxTicksLimit:8},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9},callback:v=>v.toFixed(2)+'%'},grid:{color:'#2a2e38'}}}}});
-      }
-    },100);
+    const derived=_computeMarketDerivedValues(sp500,nasdaq,spLivePrice,spPrevClose,nqLivePrice,nqPrevClose,tbill3m,tbill5y,tbill10y);
+    _renderMarketContent(el,{ts:mktTs,isLive,tsEpoch:mktTsEpoch,fredTs,fredTsEpoch,fedFutures,tbill3m,tbill5y,tbill10y,marketNews,derived});
 
     S.set('market_ts',{ts:nowPT(),tsEpoch:Date.now()});
   }catch(err){el.innerHTML=`<div class="card"><div style="font-family:var(--mono);font-size:12px;color:var(--red)">Error: ${err.message}</div></div>`;}
@@ -330,134 +394,16 @@ function _renderMarketFromCache(){
 
   const cd=S.get('tbills_cache');
   const tbill3m=cd?.tbill3m||[];
-  const tbill6m=cd?.tbill6m||[];
+  const tbill5y=cd?.tbill5y||[];
+  const tbill10y=cd?.tbill10y||[];
   const fredTs=cd?.ts||cachedTs;
   const fredTsEpoch=cd?.tsEpoch||mktTsEpoch;
-
-  const spyi_snap=S.get('snap_etf_SPYI');
-  const nbos_snap=S.get('snap_etf_NBOS');
-  const spyi_div=S.get('div_etf_SPYI');
-  const nbos_div=S.get('div_etf_NBOS');
-  let spyiYield=null,nbosYield=null;
-  if(spyi_snap?.price&&spyi_div?.distributions){const tot=spyi_div.distributions.slice(0,12).reduce((s,d)=>s+(d.amount||0),0);spyiYield=(tot/spyi_snap.price*100).toFixed(2);}
-  if(nbos_snap?.price&&nbos_div?.distributions){const tot=nbos_div.distributions.slice(0,12).reduce((s,d)=>s+(d.amount||0),0);nbosYield=(tot/nbos_snap.price*100).toFixed(2);}
-
-  const cv=S.get('vix_hist');
-  const vixCurrent=cv?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
-
-  const tb3Current=tbill3m.length?tbill3m[tbill3m.length-1].value:null;
-  const tb6Current=tbill6m.length?tbill6m[tbill6m.length-1].value:null;
-  const tb3Yr=tbill3m.length>=252?tbill3m[tbill3m.length-252].value:tbill3m[0]?.value;
-  const tb6Yr=tbill6m.length>=252?tbill6m[tbill6m.length-252].value:tbill6m[0]?.value;
-  const spread=tb3Current&&tb6Current?tb6Current-tb3Current:null;
-  const spreadStr=spread!==null?(spread>=0?`6M yields ${spread.toFixed(2)}bp above 3M (normal)`:`3M yields ${Math.abs(spread).toFixed(2)}bp above 6M (inverted -- market expects rate cuts)`):'';
-
-  const spCurrent=spLivePrice||sp500?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
-  const spPrevHist=sp500?.closes?.filter(c=>c!==null).slice(-2)[0]||null;
-  const spPrevFinal=spPrevClose||spPrevHist||null;
-  const spChg=spCurrent&&spPrevFinal?spCurrent-spPrevFinal:null;
-  const spChgPct=spChg&&spPrevFinal?spChg/spPrevFinal*100:null;
-
-  const nqCurrent=nqLivePrice||nasdaq?.closes?.filter(c=>c!==null).slice(-1)[0]||null;
-  const nqPrevHist=nasdaq?.closes?.filter(c=>c!==null).slice(-2)[0]||null;
-  const nqPrevFinal=nqPrevClose||nqPrevHist||null;
-  const nqChg=nqCurrent&&nqPrevFinal?nqCurrent-nqPrevFinal:null;
-  const nqChgPct=nqChg&&nqPrevFinal?nqChg/nqPrevFinal*100:null;
-
-  function fmtChg(val,chg,chgPct){if(!val)return'N/A';const color=chg>=0?'var(--green)':'var(--red)';const sign=chg>=0?'+':'';return`${val.toFixed(2)} <span style="color:${color};font-size:11px">${sign}${chg?.toFixed(2)} (${sign}${chgPct?.toFixed(2)}%)</span>`;}
 
   const cnews=S.get('market_news');
   const marketNews=cnews?.items||[];
 
-  const spLabels=sp500?.timestamps?.slice(-63).map(d=>{if(!(d instanceof Date))d=new Date(d);return d.toLocaleDateString('en-US',{month:'short',day:'numeric'});})||[];
-  const spData=sp500?.closes?.slice(-63)||[];
-
-  // ── Render (identical template to loadMarketTab, isLive=false) ───────────
-  el.innerHTML=`
-    ${tsChip(cachedTs,false,mktTsEpoch)}
-    <div class="card" style="border-left:4px solid var(--accent3)">
-      <div class="card-title"><span class="dot" style="background:var(--accent3)"></span>Income Engine Summary</div>
-      <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px">Your three-layer income strategy -- risk premium above risk-free rate at each layer</div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(33,150,243,0.1);border-radius:8px;border:1px solid rgba(33,150,243,0.3)">
-          <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 1 -- T-BILLS</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">3-month Treasury</div></div>
-          <div style="font-family:var(--mono);font-size:20px;font-weight:600;color:#64b5f6">${tb3Current?tb3Current.toFixed(2)+'%':'N/A'}</div>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(255,107,53,0.1);border-radius:8px;border:1px solid rgba(255,107,53,0.3)">
-          <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 2 -- ETFs</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">SPYI / NBOS TTM Yield</div></div>
-          <div style="text-align:right">
-            <div style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--accent2)">${spyiYield?'SPYI '+spyiYield+'%':'SPYI --'}${tb3Current&&spyiYield?' (+'+((parseFloat(spyiYield)-tb3Current).toFixed(2))+'% vs T-bills)':''}</div>
-            <div style="font-family:var(--mono);font-size:13px;font-weight:600;color:var(--accent2);margin-top:2px">${nbosYield?'NBOS '+nbosYield+'%':'NBOS --'}${tb3Current&&nbosYield?' (+'+((parseFloat(nbosYield)-tb3Current).toFixed(2))+'% vs T-bills)':''}</div>
-          </div>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(0,212,170,0.1);border-radius:8px;border:1px solid rgba(0,212,170,0.3)">
-          <div><div style="font-family:var(--mono);font-size:10px;color:var(--text3)">LAYER 3 -- WHEEL</div><div style="font-family:var(--mono);font-size:12px;color:var(--text2)">Active put/call selling target</div></div>
-          <div style="text-align:right"><div style="font-family:var(--mono);font-size:20px;font-weight:600;color:var(--accent)">${(parseFloat(document.getElementById('target-apy')?.value)||12).toFixed(1)}%</div><div style="font-family:var(--mono);font-size:9px;color:var(--text3)">${tb3Current?`+${((parseFloat(document.getElementById('target-apy')?.value)||12)-tb3Current).toFixed(2)}% risk premium`:'target APY (set on Dashboard tab)'}</div></div>
-        </div>
-      </div>
-    </div>
-    ${(()=>{
-      if(!fedFutures||!fedFutures.length)return'';
-      const firstRate=fedFutures[0]?.impliedRate;
-      const lastRate=fedFutures[fedFutures.length-1]?.impliedRate;
-      const rows=fedFutures.map((c,i)=>{
-        const delta=i===0?0:parseFloat((c.impliedRate-fedFutures[0].impliedRate).toFixed(3));
-        const bps=Math.round(delta*100);
-        const col=bps<-5?'var(--green)':bps>5?'var(--red)':'var(--text2)';
-        const sign=bps>0?'+':'';
-        return '<tr>'
-          +'<td style="color:var(--text2)">'+c.month+'</td>'
-          +'<td style="font-family:var(--mono)">'+c.price.toFixed(3)+'</td>'
-          +'<td style="font-family:var(--mono)">'+c.impliedRate.toFixed(3)+'%</td>'
-          +'<td style="color:'+col+';font-family:var(--mono)">'+(i===0?'—':sign+bps+'bp')+'</td>'
-          +'</tr>';
-      }).join('');
-      const totalBps=Math.round((lastRate-firstRate)*100);
-      const outlookFlat=Math.abs(totalBps)<25?'Markets pricing no change':'';
-      const outlookMild=totalBps<=-25&&totalBps>-50?'Markets pricing ~1 cut':'';
-      const summary=outlookFlat||outlookMild||(totalBps<=-50?'Markets pricing 2+ cuts':'Markets pricing 1-2 cuts');
-      return '<div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Fed Funds Futures (CME Implied Rates)</div>'
-        +'<div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:8px">30-day futures price → implied rate (100 − price). Delta vs near-month contract.</div>'
-        +'<div class="options-table-wrap"><table class="options-table">'
-        +'<thead><tr><th style="text-align:left">Month</th><th>Price</th><th>Implied Rate</th><th>Δ vs Now</th></tr></thead>'
-        +'<tbody>'+rows+'</tbody></table></div>'
-        +'<div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:8px">'+summary+' (next '+fedFutures.length+' months, '+Math.abs(totalBps)+'bp total)</div>'
-        +'</div>';
-    })()}
-    <div class="card">
-      <div class="card-title"><span class="dot" style="background:#64b5f6"></span>T-Bill Yields (^IRX / ^FVX)</div>
-      ${tsChip(fredTs,false,fredTsEpoch)}
-      <div class="metrics-grid">
-        <div class="metric-tile"><div class="metric-label">3-Month T-Bill (^IRX)</div><div class="metric-value" style="color:#64b5f6">${tb3Current?tb3Current.toFixed(3)+'%':'N/A'}</div><div class="metric-sub">${tb3Yr?`1Y ago: ${tb3Yr.toFixed(3)}% (${(tb3Current-tb3Yr)>=0?'+':''}${(tb3Current-tb3Yr).toFixed(3)}%)`:''}</div></div>
-        <div class="metric-tile"><div class="metric-label">5-Year Treasury (^FVX)</div><div class="metric-value" style="color:#64b5f6">${tb6Current?tb6Current.toFixed(3)+'%':'N/A'}</div><div class="metric-sub">${tb6Yr?`1Y ago: ${tb6Yr.toFixed(3)}% (${(tb6Current-tb6Yr)>=0?'+':''}${(tb6Current-tb6Yr).toFixed(3)}%)`:''}</div></div>
-        ${spread!==null?`<div class="metric-tile" style="grid-column:span 2"><div class="metric-label">3M / 6M Spread</div><div class="metric-value" style="font-size:13px">${Math.abs(spread).toFixed(2)}bp ${spread>=0?'(6M > 3M)':'(3M > 6M -- inverted)'}</div><div class="metric-sub">${spreadStr}</div></div>`:''}
-      </div>
-      ${tbill3m&&tbill3m.length?`<div class="chart-wrap" style="height:160px"><canvas id="tbill-chart"></canvas></div><div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:4px">52-week history of 3-month (blue) and 6-month (orange) T-bill auction rates. Source: Yahoo Finance (^IRX, ^FVX) via Cloudflare Worker.</div>`:''}
-    </div>
-    <div class="metrics-grid">
-      <div class="metric-tile" style="grid-column:span 2"><div class="metric-label">S&P 500</div><div class="metric-value" style="font-size:15px">${fmtChg(spCurrent,spChg,spChgPct)}</div></div>
-      <div class="metric-tile" style="grid-column:span 2"><div class="metric-label">Nasdaq Composite</div><div class="metric-value" style="font-size:15px">${fmtChg(nqCurrent,nqChg,nqChgPct)}</div></div>
-      ${vixCurrent?`<div class="metric-tile" style="grid-column:span 2;background:${vixCurrent>=30?'rgba(255,71,87,0.1)':vixCurrent>=20?'rgba(255,165,2,0.1)':'var(--surface2)'}"><div class="metric-label">VIX (from cache)</div><div class="metric-value" style="color:${vixCurrent>=30?'var(--red)':vixCurrent>=20?'var(--warn)':'var(--text)'}">${vixCurrent.toFixed(2)}</div><div class="metric-sub">${vixCurrent>=30?'FEAR SPIKE -- exceptional premium':vixCurrent>=20?'ELEVATED -- favorable for selling':'Normal conditions'}</div></div>`:''}
-    </div>
-    ${spLabels.length?`<div class="card"><div class="card-title"><span class="dot" style="background:#4fc3f7"></span>S&P 500 (3 months)</div><div class="chart-wrap" style="height:180px"><canvas id="sp500-chart"></canvas></div></div>`:''}
-    <div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Top Market News</div><div>${renderNewsItems(marketNews,10)}</div></div>`;
-
-  // Render charts from cached data
-  setTimeout(()=>{
-    const ctx=document.getElementById('sp500-chart')?.getContext('2d');
-    if(ctx&&spLabels.length){new Chart(ctx,{type:'line',data:{labels:spLabels,datasets:[{data:spData,borderColor:'#4fc3f7',borderWidth:1.5,pointRadius:0,tension:0.2,fill:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#555870',font:{size:9},maxTicksLimit:6},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9}},grid:{color:'#2a2e38'}}}}});}
-    const tbCtx=document.getElementById('tbill-chart')?.getContext('2d');
-    if(tbCtx&&tbill3m.length){
-      const last52_3m=tbill3m.slice(-52);
-      const last52_6m=tbill6m.slice(-52);
-      const chartLabels=last52_3m.map(d=>d.date.slice(5));
-      const aligned6m=last52_6m.slice(-last52_3m.length).map(d=>d.value);
-      new Chart(tbCtx,{type:'line',data:{labels:chartLabels,datasets:[
-        {label:'3-Month T-bill',data:last52_3m.map(d=>d.value),borderColor:'#64b5f6',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false},
-        {label:'6-Month T-bill',data:aligned6m,borderColor:'#ff9800',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false}
-      ]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b8fa8',font:{size:9}}}},scales:{x:{ticks:{color:'#555870',font:{size:9},maxTicksLimit:8},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9},callback:v=>v.toFixed(2)+'%'},grid:{color:'#2a2e38'}}}}});
-    }
-  },100);
+  const derived=_computeMarketDerivedValues(sp500,nasdaq,spLivePrice,spPrevClose,nqLivePrice,nqPrevClose,tbill3m,tbill5y,tbill10y);
+  _renderMarketContent(el,{ts:cachedTs,isLive:false,tsEpoch:mktTsEpoch,fredTs,fredTsEpoch,fedFutures,tbill3m,tbill5y,tbill10y,marketNews,derived});
 
   setTimeout(refreshTsChipAges,200);
 }

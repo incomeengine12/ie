@@ -84,6 +84,8 @@
       <button class="btn btn-secondary" id="dash-view-rsi" onclick="setDashboardViewMode('rsi')" style="font-size:10px;padding:3px 8px;opacity:0.4">RSI Backtest</button>
       <button class="btn btn-secondary" id="dash-view-risk" onclick="setDashboardViewMode('risk')" style="font-size:10px;padding:3px 8px;opacity:0.4">ITM Risk</button>
       <button class="btn btn-secondary" id="dash-view-gap" onclick="setDashboardViewMode('gap')" style="font-size:10px;padding:3px 8px;opacity:0.4">Gap Fill</button>
+      <button class="btn btn-secondary" id="dash-view-notes" onclick="setDashboardViewMode('notes')" style="font-size:10px;padding:3px 8px;opacity:0.4">Notes</button>
+      <button class="btn btn-secondary" id="dash-view-wheelbt" onclick="setDashboardViewMode('wheelbt')" style="font-size:10px;padding:3px 8px;opacity:0.4">Wheel Backtest</button>
     </div>
   </div>
   <div id="dash-conviction-controls" class="card">
@@ -150,7 +152,54 @@
     </div>
     <div id="gap-fill-content"><div class="empty"><div class="empty-icon">&#x1F4CA;</div>Loading...</div></div>
   </div>
+  <div id="dash-notes-card" class="card" style="display:none">
+    <div class="card-title"><span class="dot" style="background:#4fc3f7"></span>Notes</div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:10px">Freeform notes, not tied to any single ticker. Saved automatically as you type.</div>
+    <textarea id="dash-notes-text" oninput="_saveDashboardNotes()" style="width:100%;box-sizing:border-box;min-height:420px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--mono);font-size:12px;padding:10px;resize:vertical;outline:none"></textarea>
+    <div id="dash-notes-status" style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:4px;text-align:right">&nbsp;</div>
+  </div>
+  <div id="dash-wheelbt-card" class="card" style="display:none">
+    <div class="card-title"><span class="dot" style="background:#7c6af7"></span>Wheel Backtest</div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:10px">Simulates the wheel (CSP &rarr; assignment &rarr; CC &rarr; called away &rarr; repeat) against real historical prices, using real monthly (3rd-Friday) expirations. Strike each cycle is the one closest to your target APY while still clearing it -- not a fixed delta. If your preferred expiration can't clear the floor, tries the other expirations (1-3mo, whichever works), then waits for a later day if none do. Black-Scholes premiums, realized volatility standing in for implied vol -- see "Premium source" below. Strategy selector below chooses which entry rules apply -- see "Strategy" in the Guide tab.</div>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px">This is not real historical options data -- an approximation using each stock's own price history.</div>
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+      <span style="font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px">Scope:</span>
+      <select class="input" id="wheelbt-ticker-sel" onchange="renderWheelBacktest()" style="font-family:var(--mono);font-size:11px;padding:4px 6px;flex:1">
+        <option value="">Aggregate (whole watchlist)</option>
+        <option value="__starred__">Starred Only</option>
+      </select>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+      <span style="font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px">Strategy:</span>
+      <select class="input" id="wheelbt-strategy-sel" onchange="setWheelBacktestStrategy()" style="font-family:var(--mono);font-size:11px;padding:4px 6px;flex:1">
+        <option value="default">Default</option>
+        <option value="no-earnings-csp">No Earnings Overlap (CSP)</option>
+      </select>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px">
+      <span style="font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px">Target APY:</span>
+      <input class="input" type="number" id="wheelbt-target-apy-input" value="12" step="0.5" min="0" onchange="setWheelBacktestTargetAPY()" style="font-family:var(--mono);font-size:11px;padding:4px 6px;width:64px">
+      <span style="font-family:var(--mono);font-size:10px;color:var(--text3)">% &mdash; independent of Conviction Scoring's target</span>
+    </div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-bottom:4px">Preferred Expiration (starting point -- see above)</div>
+    <div style="display:flex;gap:5px;margin-bottom:12px">
+      <button class="btn btn-secondary" id="wheelbt-months-1" onclick="setWheelBacktestMonths(1)" style="flex:1;font-size:10px;padding:4px 0;opacity:0.4">1 Month</button>
+      <button class="btn btn-secondary" id="wheelbt-months-2" onclick="setWheelBacktestMonths(2)" style="flex:1;font-size:10px;padding:4px 0;opacity:1">2 Months</button>
+      <button class="btn btn-secondary" id="wheelbt-months-3" onclick="setWheelBacktestMonths(3)" style="flex:1;font-size:10px;padding:4px 0;opacity:0.4">3 Months</button>
+    </div>
+    <div id="wheelbt-content"><div class="empty"><div class="empty-icon">&#x1F4CA;</div>Loading...</div></div>
+  </div>
+  <div id="dash-wheelbt-ranking-card" class="card" style="display:none">
+    <div class="card-title"><span class="dot" style="background:#7c6af7"></span>Best Tickers for the Wheel</div>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px">Every watchlist ticker's median simulated return, ranked -- always across the whole watchlist regardless of the Scope selection above. Uses the same Preferred Expiration and Target APY settings from the card above.</div>
+    <div style="display:flex;gap:4px;margin-bottom:10px">
+      <span id="wheelbt-ranking-filter-all" onclick="setWheelBacktestRankingFilter('all')" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:var(--accent);color:#000">All</span>
+      <span id="wheelbt-ranking-filter-starred" onclick="setWheelBacktestRankingFilter('starred')" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:var(--surface3);color:var(--text3)">Starred Only</span>
+    </div>
+    <div id="wheelbt-ranking-content"><div class="empty"><div class="empty-icon">&#x1F4CA;</div>Loading...</div></div>
+  </div>
 </div>
+
 
 <!-- WATCHLIST TAB -->
 <div id="tab-watchlist" class="tab-panel">
@@ -173,7 +222,7 @@
       <button class="btn btn-secondary" id="wl-filter-positions" onclick="setWatchlistFilterMode('positions')" style="font-size:10px;padding:3px 8px;opacity:0.4;white-space:nowrap">Positions</button>
       <button class="btn btn-secondary" id="wl-filter-starred" onclick="setWatchlistFilterMode('starred')" style="font-size:10px;padding:3px 8px;opacity:0.4;white-space:nowrap">Starred</button>
     </div>
-    <button class="btn btn-secondary" id="prefetch-btn" onclick="prefetchAll()">Prefetch All Ticker Data</button>
+    <button class="btn btn-success" id="prefetch-btn" onclick="prefetchAll()">Prefetch All Ticker Data</button>
     <div id="refresh-health-badge" onclick="openRefreshHealthModal()" style="display:none;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:6px;border:1px solid;cursor:pointer;margin-top:4px;color:var(--text2)"></div>
     <div id="prefetch-progress" style="display:none">
       <div class="progress-bar-wrap"><div class="progress-bar" id="prefetch-progress-bar" style="width:0%"></div></div>
@@ -466,6 +515,22 @@
     <div class="guide-kv"><span class="guide-key">Inventory, not backtest</span><span class="guide-val">Unlike RSI Backtest's fixed windows, this is a full inventory -- every qualifying gap found in your cached history (up to 2 years), with its fill status and how long it took, to the extent your cache has data for.</span></div>
     <div class="guide-kv"><span class="guide-key">Badge</span><span class="guide-val">An unfilled gap within the last 10 trading days, or one that filled within the last 10 days -- whichever is more recent takes priority if both would apply. Shows direction, size, and the actual price range the gap spans.</span></div>
     <div class="guide-kv"><span class="guide-key">Sample size</span><span class="guide-val">Per-ticker gap counts over 2 years are typically small -- a handful to a few dozen. The aggregate view across your whole watchlist is the more statistically meaningful lens for any single ticker's history to lean on.</span></div>
+    <div class="guide-h3">Wheel Backtest</div>
+    <div class="guide-kv"><span class="guide-key">What it simulates</span><span class="guide-val">The full wheel cycle (cash-secured put &rarr; assignment &rarr; covered call &rarr; called away &rarr; repeat) against real historical prices, using real monthly (3rd-Friday) expirations -- not an arbitrary day count from whenever a cycle happened to start.</span></div>
+    <div class="guide-kv"><span class="guide-key">Strike selection</span><span class="guide-val">The strike closest to your Target APY while still clearing it -- not a fixed delta. If your Preferred Expiration can't clear the floor, tries the other expirations (1-3mo, whichever actually works, prioritized by closeness to your preference), then waits for a later trading day if none do.</span></div>
+    <div class="guide-kv"><span class="guide-key">Realistic strikes</span><span class="guide-val">Snapped to standard CBOE increments ($2.50 &le;$25, $5 $25-$200, $10 &gt;$200) -- always rounded toward the money, never away from it, so a snapped strike is guaranteed to still clear your floor whenever the underlying theoretical strike did.</span></div>
+    <div class="guide-kv"><span class="guide-key">Term structure</span><span class="guide-val">Estimated once per ticker from that stock's own history (how much higher its realized vol tends to run at ~3 months than at ~1 month) -- this is what lets extending duration genuinely help clear the floor, rather than just costing annualized efficiency.</span></div>
+    <div class="guide-kv"><span class="guide-key">Rolling windows</span><span class="guide-val">Each simulated 1-year window starts the trading day right after a real monthly expiration -- anchored to actual expiration-to-expiration transitions, not an arbitrary fixed step, so the sample reflects genuinely distinct scenarios rather than many near-duplicate starts.</span></div>
+    <div class="guide-kv"><span class="guide-key">Worst / median / best</span><span class="guide-val">The spread across every qualifying rolling window, with a marker at your Target APY and a plain-language sentence on what percentage of windows actually beat it.</span></div>
+    <div class="guide-kv"><span class="guide-key">Scope</span><span class="guide-val">Aggregate (whole watchlist), Starred Only, or a single ticker. Target APY and Preferred Expiration are independent settings for this feature specifically -- changing them here never changes Conviction Scoring's own target, or vice versa.</span></div>
+    <div class="guide-kv"><span class="guide-key">Strategy</span><span class="guide-val">"Default" is the strike/expiration rules described above with no other restriction. "No Earnings Overlap (CSP)" additionally never opens a cash-secured put whose window would span the ticker's own earnings date -- reuses the same day-by-day retry that already handles a thin yield floor, so a hiatus of a month or more around earnings is expected, not a bug. Covered calls are unaffected by this strategy. Earnings dates use the same source and override precedence as the Ticker tab (manual override, then auto-confirmed, then estimate); a ticker with no cached earnings data yet behaves like Default for that ticker until it's been through Prefetch or a Ticker tab visit.</span></div>
+    <div class="guide-kv"><span class="guide-key">Best Tickers</span><span class="guide-val">Every qualifying watchlist ticker ranked by median simulated return, always across the whole watchlist regardless of the Scope selection above. A gold star marks tickers you've starred, so they're easy to spot while scanning a long list -- toggle All / Starred Only above the list to filter down to just those. Tap a ticker name to jump to its Ticker page, or "View analysis" to load that ticker's specific report in the card above.</span></div>
+    <div class="guide-kv"><span class="guide-key">One Example Run</span><span class="guide-val">The single most calendar-recent complete window, shown cycle by cycle -- strike, DTE used, % out of the money, outcome, this leg's own gain, and a running cumulative total, ending in a "Total this run" summary that reconciles exactly with the per-row numbers above it.</span></div>
+    <div class="guide-kv"><span class="guide-key">Full History toggle</span><span class="guide-val">Switches the example run from "Most Recent" (~1 year) to one continuous run across the ticker's entire cached history. Shows both the raw total (unannualized, since it spans more than a year) and that same total's annualized equivalent side by side.</span></div>
+    <div class="guide-kv"><span class="guide-key">Premium source</span><span class="guide-val">Black-Scholes pricing with realized volatility standing in for implied volatility -- real historical options-chain data isn't available without a paid feed. This is a documented approximation, always labeled as such in the results, and likely understates real historical premium somewhat (implied vol typically runs above subsequent realized vol) -- a conservative bias, not an inflated one.</span></div>
+    <div class="guide-kv"><span class="guide-key">Not modeled</span><span class="guide-val">Bid-ask spread, volatility skew beyond the term-structure estimate, and dividend-driven early assignment are all out of scope for this version -- treat results as directional, not a precise forecast.</span></div>
+    <div class="guide-h3">Notes</div>
+    <div class="guide-kv"><span class="guide-key">Purpose</span><span class="guide-val">A freeform scratchpad on the Dashboard, separate from per-ticker Watchlist notes -- for anything broader that isn't tied to a single stock. No length limit. Saves automatically a moment after you stop typing.</span></div>
   </div>
 </div>
 
@@ -566,7 +631,7 @@
     <div class="guide-kv"><span class="guide-key">Opportunity</span><span class="guide-val">Ranked by the higher of that ticker's put or covered call conviction score. Run the conviction dashboards on the Dashboard tab first -- without scores computed, this sort has nothing to rank by.</span></div>
     <div class="guide-h3">Cards</div>
     <div class="guide-kv"><span class="guide-key">Badges</span><span class="guide-val">HVR, unusual volume, RSI transition, and Gap Fill can each appear on a card when relevant -- see their respective Guide sections for what triggers each one.</span></div>
-    <div class="guide-kv"><span class="guide-key">Notes</span><span class="guide-val">Tap a card's note area to add free text. Long notes truncate to one line -- tap the note itself to expand or collapse it.</span></div>
+    <div class="guide-kv"><span class="guide-key">Notes</span><span class="guide-val">Tap a card's note area to add free text, up to 500 characters. Long notes truncate to one line -- tap the note itself to expand or collapse it.</span></div>
   </div>
 </div>
 
@@ -629,7 +694,7 @@
     <div class="guide-kv"><span class="guide-key">Firewall</span><span class="guide-val">Each account has completely independent Layer 1, Layer 2, Layer 3 inputs, position trackers, MMF yield cache, and target APY. Switching accounts loads that account's data. Nothing is shared between accounts except Layer 2 ETF yields (market data, not account-specific).</span></div>
     <div class="guide-kv"><span class="guide-key">Add account</span><span class="guide-val">Tap the ＋ button at the end of the chip row. Enter a name (e.g. "SEP IRA", "HSA"). New accounts start empty.</span></div>
     <div class="guide-kv"><span class="guide-key">Rename / delete</span><span class="guide-val">Long-press (or right-tap on desktop) any account chip to rename or delete it. Renaming does not affect stored data. Deleting an account with active positions requires exporting a backup first.</span></div>
-    <div class="guide-kv"><span class="guide-key">All Accounts overview</span><span class="guide-val">Tap "All Accounts ↗" to open a summary pop-up showing all accounts at a glance: position counts, notional values, ITM flags, and expiry urgency (⚠ red = ≤2 days, ⚡ amber = ≤7 days). Tap any account row in the overview to switch directly to that account.</span></div>
+    <div class="guide-kv"><span class="guide-key">All Accounts overview</span><span class="guide-val">Tap "All Accounts ↗" to open a summary pop-up. A blended-yield hero at the top shows your true annualized yield across every account combined -- total income summed, then yield recalculated from those totals (not an average of each account's own yield, which would misweight differently-sized accounts). Below that: position counts, notional values, ITM flags, and expiry urgency (⚠ red = ≤2 days, ⚡ amber = ≤7 days) per account. Tap any account row to switch directly to that account.</span></div>
     <div class="guide-kv"><span class="guide-key">Sticky selection</span><span class="guide-val">The last-viewed account is remembered across app launches. When you open the Income tab, you land on the same account you were last viewing.</span></div>
     <div class="guide-kv"><span class="guide-key">Export / import</span><span class="guide-val">Backups include all accounts. The import preview shows each account by name with its position count. Restoring a backup replaces all accounts simultaneously.</span></div>
   </div>
@@ -1299,6 +1364,7 @@ v1.7 -- 2026-04-29
 <script src="./js/settings.js"></script>
 <script src="./js/watchlist.js"></script>
 <script src="./js/dashboard.js"></script>
+<script src="./js/wheelbacktest.js"></script>
 <script src="./js/ticker.js"></script>
 <script src="./js/options.js"></script>
 <script src="./js/earnings.js"></script>
@@ -1512,7 +1578,17 @@ function init(){
   window.addEventListener('online',updateOnlineIndicator);
   window.addEventListener('offline',updateOnlineIndicator);
   // Start market status banner ticker -- every second
-  try{updateMarketBanner();}catch(e){console.error('Banner error:',e);}
+  try{updateMarketBanner();}catch(e){
+    console.error('Banner error:',e);
+    // Previously this failed completely silently -- the static placeholder
+    // ("Loading market status...") would stay on screen indefinitely with
+    // no indication anything was wrong, easily mistaken for the app still
+    // loading rather than a real error.
+    try{
+      const banner=document.getElementById('market-status-banner');
+      if(banner){banner.className='mkt-closed';banner.textContent='Market status unavailable -- try refreshing';}
+    }catch(e2){}
+  }
   setInterval(function(){try{updateMarketBanner();}catch(e){console.error('Banner interval error:',e);}},1000);
   updateHeaderStatus();
   setInterval(()=>{try{updateHeaderStatus();}catch(e){console.warn('Header:',e.message);}},60000);
@@ -1542,7 +1618,7 @@ if(document.readyState==='loading'){
   try{init();}catch(e){console.error('Init error:',e);toast('App init error: '+e.message,5000);}
 }
 
-if('serviceWorker'in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('./sw.js').then(reg=>{window._swReg=reg;_updateBuildLabel();}).catch(err=>console.warn('SW:',err));});
+if('serviceWorker'in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('./sw.js').then(reg=>{window._swReg=reg;_updateBuildLabel();}).catch(err=>console.warn('SW:',err));navigator.serviceWorker.addEventListener('controllerchange',()=>{_updateBuildLabel();try{toast('New version installed -- refresh to load it',5000);}catch(e){}});});
 }
 </script>
 <!-- Income account switcher bar -- OUTSIDE #app to escape CSS zoom context.

@@ -403,11 +403,12 @@ function clearMarketDataCache(){
 const EXPORT_KEYS_STATIC=[
   'watchlist','tz_pref','font_size','vix_threshold',
   'offline_mode','watchlist_sort','heatmap_mode','watchlist_filter_mode','watchlist_starred','put_pos_sort','cc_pos_sort',
-  'options_cutoff_et','rp_earnings_toggle','conviction_weights','earnings_view_mode','dashboard_view_mode',
+  'options_cutoff_et','rp_earnings_toggle','rp_total_return','conviction_weights','earnings_view_mode','dashboard_view_mode',
   'vol_badge_state','last_ticker',
   'etf_research_tickers',
   'income_accounts_meta','income_active_account','income_migration_v1',
   'debug_options_fetch','prefetch_sleep_ms','fetch_upgrades_enabled',
+  'dashboard_notes','bb_gap_overlay','gap_list_filter',
 ];
 
 function _buildExportData(){
@@ -686,6 +687,18 @@ function previewImport(){
         if(entries.length)lines.push('<div style="color:var(--text2);padding-left:10px">'+t+': '+entries.length+' confirmed date'+(entries.length>1?'s':'')+' ('+entries.map(e=>e.date+(e.hour?' '+e.hour.toUpperCase():'')).join(', ')+')</div>');
       });
       lines.push('</div>');
+    }
+  }catch{}
+
+  // Dashboard notes -- substantial user-authored content, same treatment
+  // as Watchlist Notes below, unlike the minor settings/toggles that are
+  // intentionally left out of this preview and covered only by the total
+  // key count footer.
+  try{
+    if(typeof keys.dashboard_notes==='string'&&keys.dashboard_notes.trim()){
+      const note=keys.dashboard_notes;
+      lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">NOTES ('+note.length+' char'+(note.length!==1?'s':'')+')</span>');
+      lines.push('<div style="color:var(--text2);padding-left:10px">'+note.slice(0,100).replace(/</g,'&lt;').replace(/>/g,'&gt;')+(note.length>100?'…':'')+'</div></div>');
     }
   }catch{}
 

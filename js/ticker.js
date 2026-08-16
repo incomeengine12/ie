@@ -1,6 +1,13 @@
 // Income Engine -- ticker.js
 // currentBBSpan declared as global in index.html
 function _tkTimeout(p,ms,label){return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('Timeout: '+label)),ms))]);}
+// hist2y_-style timestamp -> 'YYYY-MM-DD'. Goes through the shared
+// _parseHist2yDate() (defined in wheelbacktest.js, loaded earlier) so the
+// epoch-seconds-vs-milliseconds handling stays in one place instead of
+// being reimplemented per call site -- previously three separate local
+// closures here had three slightly different (one incomplete) versions
+// of this same check.
+function _tkDateStr(d){const parsed=_parseHist2yDate(d);return parsed?parsed.toISOString().split('T')[0]:null;}
 // Ticker tab: load, render, restore from cache, chart functions.
 // Globals used: currentTicker, WORKER_URL, S, offlineMode
 // Dependencies: helpers.js, api.js, storage.js
@@ -36,7 +43,13 @@ async function loadTicker(){
     // is only fetched when explicitly enabled in Settings (default off).
     let earnings,upgrades,ah,qs,h2;
     const _finnhubSeq=(async()=>{
-      const _e=await fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`);
+      // Some security types (e.g. mutual funds) trigger a 403 from Finnhub's
+      // earnings-calendar endpoint rather than an empty result -- caught
+      // here so it degrades to "no earnings data" (which is simply true for
+      // a mutual fund) instead of aborting this whole Promise.all and
+      // discarding the Yahoo quote/history data that succeeded fine on its
+      // own. prefetch.js already guards this identical call the same way.
+      const _e=await fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`).catch(e=>{console.warn('earnings calendar failed:',t,e?.message);return null;});
       const _u=_fetchUpgrades?await fh(`/stock/upgrade-downgrade?symbol=${t}&from=${fmtDate(addDays(new Date(),-90))}`).catch(()=>null):null;
       return[_e,_u];
     })();
@@ -47,10 +60,27 @@ async function loadTicker(){
     ]);
     try{
       [[earnings,upgrades],[ah,qs,h2]]=await Promise.all([_finnhubSeq,_yahooBatch]);
-      // Build snap from Yahoo /quote (via fetchAfterHoursPrice which now returns full quote fields)
-      if(!ah||!ah.price)throw new Error('Yahoo quote failed for '+t);
-      const _price=ah.price;
-      const _prev=ah.prevClose||_price;
+      // Build snap from Yahoo /quote (via fetchAfterHoursPrice which now returns full quote fields).
+      // Some security types -- notably mutual funds, which price once daily
+      // via NAV rather than a continuously-updating "regular market price"
+      // -- don't populate regularMarketPrice via the live /quote endpoint
+      // even though the quote request itself succeeds. Fall back to the
+      // latest close from the concurrently-fetched 2Y history in that case
+      // (h2 -- already fetched, no extra network cost required) -- for a
+      // once-daily-priced security that's the more correct number anyway,
+      // not just a workaround for a missing field. ah is normalized to {}
+      // rather than left null so every ah.xxx access below stays safe.
+      if(!ah)ah={};
+      let _price=ah.price,_prev=ah.prevClose;
+      if(_price==null&&h2?.closes?.length){
+        const _validCloses=h2.closes.filter(c=>c!=null&&c>0);
+        if(_validCloses.length){
+          _price=_validCloses[_validCloses.length-1];
+          _prev=_validCloses.length>=2?_validCloses[_validCloses.length-2]:_price;
+        }
+      }
+      if(_price==null)throw new Error('No data available for '+t);
+      _prev=_prev||_price;
       const _prevSnap=S.get('snap_'+t);
       const _pmFields=_resolvePostMarketFields(ah,_prevSnap);
       snap={
@@ -824,14 +854,13 @@ function renderBBChart(bbData,hist){
         if(!h2?.timestamps||!h2.opens||!h2.highs||!h2.lows)return;
         const events=_computeGapEvents(t,h2);
         if(!events||!events.length)return;
-        const toDateStr=d=>{if(d instanceof Date)return d.toISOString().split('T')[0];return new Date(typeof d==='number'&&d<1e10?d*1000:d).toISOString().split('T')[0];};
-        const visibleDates=bbData.timestamps.map(toDateStr);
+        const visibleDates=bbData.timestamps.map(_tkDateStr);
         const dateToIdx={};visibleDates.forEach((d,i)=>{dateToIdx[d]=i;});
         const c=chart.ctx,xs=chart.scales.x,ys=chart.scales.y;
         c.save();
         c.setLineDash([3,3]);c.lineWidth=1;
         events.filter(e=>!e.filled).forEach(e=>{
-          const gapDateStr=toDateStr(h2.timestamps[e.index]);
+          const gapDateStr=_tkDateStr(h2.timestamps[e.index]);
           const startIdx=dateToIdx[gapDateStr];
           if(startIdx==null)return; // gap falls outside the currently visible span
           const xStart=xs.getPixelForValue(startIdx);
@@ -1430,24 +1459,20 @@ function renderRelPerfChart(ticker,hist2y,hist2ySP,earningsHistory,span,cmpSerie
   const cutoff=new Date(Date.now()-cutoffDays*86400000);
 
   // Align series by date -- find common date range
-  const _toDateStr=d=>{
-    if(d instanceof Date)return d.toISOString().split('T')[0];
-    return new Date(d*1000).toISOString().split('T')[0];
-  };
   const stockDates=hist2y.timestamps
-    .map((d,i)=>({d:_toDateStr(d),i}))
-    .filter(({d})=>new Date(d+'T00:00:00Z')>=cutoff)
+    .map((d,i)=>({d:_tkDateStr(d),i}))
+    .filter(({d})=>d&&new Date(d+'T00:00:00Z')>=cutoff)
     .map(({d})=>d);
   const spDates=hist2ySP.timestamps
-    .map((d,i)=>({d:_toDateStr(d),i}))
-    .filter(({d})=>new Date(d+'T00:00:00Z')>=cutoff)
+    .map((d,i)=>({d:_tkDateStr(d),i}))
+    .filter(({d})=>d&&new Date(d+'T00:00:00Z')>=cutoff)
     .map(({d})=>d);
   const _stockFiltered=hist2y.timestamps
-    .map((d,i)=>({d:_toDateStr(d),c:hist2y.closes[i]}))
-    .filter(({d})=>new Date(d+'T00:00:00Z')>=cutoff);
+    .map((d,i)=>({d:_tkDateStr(d),c:hist2y.closes[i]}))
+    .filter(({d})=>d&&new Date(d+'T00:00:00Z')>=cutoff);
   const _spFiltered=hist2ySP.timestamps
-    .map((d,i)=>({d:_toDateStr(d),c:hist2ySP.closes[i]}))
-    .filter(({d})=>new Date(d+'T00:00:00Z')>=cutoff);
+    .map((d,i)=>({d:_tkDateStr(d),c:hist2ySP.closes[i]}))
+    .filter(({d})=>d&&new Date(d+'T00:00:00Z')>=cutoff);
 
   const stockMap={};_stockFiltered.forEach(({d,c})=>{if(c!=null)stockMap[d]=c;});
   const spMap={};_spFiltered.forEach(({d,c})=>{if(c!=null)spMap[d]=c;});
@@ -1457,8 +1482,8 @@ function renderRelPerfChart(ticker,hist2y,hist2ySP,earningsHistory,span,cmpSerie
   if(cmpSeries&&cmpSeries.timestamps&&cmpSeries.closes){
     cmpMap={};
     cmpSeries.timestamps
-      .map((d,i)=>({d:_toDateStr(d),c:cmpSeries.closes[i]}))
-      .filter(({d})=>new Date(d+'T00:00:00Z')>=cutoff)
+      .map((d,i)=>({d:_tkDateStr(d),c:cmpSeries.closes[i]}))
+      .filter(({d})=>d&&new Date(d+'T00:00:00Z')>=cutoff)
       .forEach(({d,c})=>{if(c!=null)cmpMap[d]=c;});
   }
 
@@ -1888,16 +1913,36 @@ async function refreshSingleTicker(){
     // Finnhub: only earnings calendar + news/recommendations. Historical earnings
     // and upgrades handled as noted below.
     let _rUpgradesErr=null;
-    const earnings=await fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`);
+    // Same 403-for-unsupported-security-type guard as loadTicker/prefetch.js
+    // -- a mutual fund genuinely has no earnings calendar, and that should
+    // degrade gracefully rather than aborting the whole refresh before it
+    // even reaches the quote/history steps below.
+    const earnings=await fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`).catch(e=>{console.warn('earnings calendar failed:',t,e?.message);return null;});
     let upgrades=null,priceTargetS=null;
     if(_fetchUpgrades){
       try{upgrades=await fh(`/stock/upgrade-downgrade?symbol=${t}&from=${fmtDate(addDays(new Date(),-90))}`);}catch(e){_rUpgradesErr=e?.message||'failed';}
     }
-    // Build snap from Yahoo /quote
+    // Build snap from Yahoo /quote. Fetched concurrently with 2Y history
+    // (rather than waiting for Step 3 below) specifically so the
+    // once-daily-NAV fallback has data to fall back to right away -- same
+    // pattern and reasoning as loadTicker.
     setP(20,'Fetching '+t+' Yahoo quote...');
-    const ah=await fetchAfterHoursPrice(t);
-    if(!ah||!ah.price)throw new Error('Yahoo quote failed for '+t);
-    const _rPrice=ah.price,_rPrev=ah.prevClose||ah.price;
+    let ah,_rh2;
+    [ah,_rh2]=await Promise.all([
+      fetchAfterHoursPrice(t),
+      _tkTimeout(yahooHistory(t,'2y','1d'),15000,'hist2y').catch(e=>{console.warn('hist2y failed:',t,e?.message);return null;})
+    ]);
+    if(!ah)ah={};
+    let _rPrice=ah.price,_rPrev=ah.prevClose;
+    if(_rPrice==null&&_rh2?.closes?.length){
+      const _validCloses=_rh2.closes.filter(c=>c!=null&&c>0);
+      if(_validCloses.length){
+        _rPrice=_validCloses[_validCloses.length-1];
+        _rPrev=_validCloses.length>=2?_validCloses[_validCloses.length-2]:_rPrice;
+      }
+    }
+    if(_rPrice==null)throw new Error('No data available for '+t);
+    _rPrev=_rPrev||_rPrice;
     const futE=(earnings?.earningsCalendar||[]).filter(e=>e.date>=_todayET()).sort((a,b)=>a.date.localeCompare(b.date));
     const _rPrevSnap=S.get('snap_'+t);
     const _rPmFields=_resolvePostMarketFields(ah,_rPrevSnap);
@@ -1953,12 +1998,11 @@ async function refreshSingleTicker(){
     }
     // Step 3: Price history
     setP(35,'Fetching '+t+' price history...');
-    // Single 2Y fetch populates all three history cache keys; intraday in parallel
+    // 2Y history was already fetched above (needed for the price fallback) --
+    // only intraday remains to fetch here now.
     try{
-      const [_rh2,_idRes]=await Promise.all([
-        _tkTimeout(yahooHistory(t,'2y','1d'),15000,'hist2y'),
-        _tkTimeout(yahooHistory(t,'1d','5m'),10000,'intraday').catch(e=>{console.warn('intraday failed:',t,e?.message);return null;})
-      ]);
+      const _idRes=await _tkTimeout(yahooHistory(t,'1d','5m'),10000,'intraday').catch(e=>{console.warn('intraday failed:',t,e?.message);return null;});
+      if(!_rh2)throw new Error('hist2y unavailable');
       const _rts=_rh2.timestamps.map(d=>Math.floor(d.getTime()/1000));
       const _rcl=_rh2.closes.map(v=>v!=null?Math.round(v*100)/100:null);
       const _rvl=_rh2.volumes?_rh2.volumes.map(v=>v||0):null;
