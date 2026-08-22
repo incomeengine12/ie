@@ -185,17 +185,105 @@ async function checkFlightModeReady(){
   }
 }
 
+// Shared by measureStorage() and measureRealStorageCapacity() -- total bytes
+// currently used across all of localStorage (UTF-16, 2 bytes/char, same
+// convention as the rest of this file's byte accounting).
+function _totalLocalStorageBytes(){
+  let total=0;
+  for(let i=0;i<localStorage.length;i++){
+    const k=localStorage.key(i);
+    total+=(localStorage.getItem(k)||'').length*2;
+  }
+  return total;
+}
+
+// Optional, explicit-opt-in test that empirically finds this device's real
+// localStorage ceiling, since no browser API reports it directly on iOS
+// Safari. Writes throwaway keys in a fixed-size chunk until the first
+// QuotaExceededError, then halves the chunk size and keeps writing from
+// where it left off, repeating until the chunk size drops below a small
+// floor -- narrowing in on the boundary rather than settling for whatever
+// the first coarse chunk size happened to land on. Every write is
+// completely synchronous (no awaits inside the loop), so nothing else in
+// the app can interleave a real write attempt while this is running close
+// to the edge. All throwaway keys are cleaned up in a finally block
+// regardless of how the loop ends, and a startup safety net (see
+// _cleanupStrayStorageTestKeys, called from init) catches any that
+// somehow survive an interruption (e.g. the app being backgrounded
+// mid-test). The measured result is stored locally only -- deliberately
+// not added to EXPORT_KEYS_STATIC or any of the export prefix patterns,
+// since it describes this specific device, not portable app data.
+function measureRealStorageCapacity(){
+  const btn=document.getElementById('storage-capacity-test-btn');
+  const el=document.getElementById('storage-display');
+  if(btn)btn.disabled=true;
+  if(el)el.textContent='Measuring real storage capacity...';
+
+  const PREFIX='_storagetest_';
+  const MIN_CHUNK_BYTES=512;
+  let chunkBytes=51200; // 50KB starting point
+  let writtenBytes=0;
+  let keyIdx=0;
+  const preTestBytes=_totalLocalStorageBytes();
+
+  try{
+    while(chunkBytes>=MIN_CHUNK_BYTES){
+      try{
+        // Each character is one UTF-16 code unit (2 bytes) -- matches the
+        // length*2 convention used everywhere else in this file.
+        localStorage.setItem(PREFIX+keyIdx,'x'.repeat(Math.floor(chunkBytes/2)));
+        writtenBytes+=chunkBytes;
+        keyIdx++;
+      }catch(e){
+        const isQuota=e&&(e.name==='QuotaExceededError'||e.code===22);
+        if(!isQuota){
+          console.warn('Unexpected error during storage capacity test, stopping early:',e?.message);
+          break;
+        }
+        chunkBytes=Math.floor(chunkBytes/2);
+      }
+    }
+  }finally{
+    for(let i=0;i<keyIdx;i++)localStorage.removeItem(PREFIX+i);
+  }
+
+  const measuredTotalKB=Math.round((preTestBytes+writtenBytes)/1024);
+  S.set('_storage_capacity_kb',{kb:measuredTotalKB,measuredAt:nowPT()});
+  if(btn)btn.disabled=false;
+  measureStorage();
+}
+
+// Startup safety net -- if measureRealStorageCapacity() was somehow
+// interrupted before its own finally block could clean up (e.g. the app
+// backgrounded mid-test), remove any surviving throwaway keys on next load
+// rather than leaving them to silently eat into real storage headroom.
+function _cleanupStrayStorageTestKeys(){
+  const stray=[];
+  for(let i=0;i<localStorage.length;i++){
+    const k=localStorage.key(i);
+    if(k&&k.startsWith('_storagetest_'))stray.push(k);
+  }
+  stray.forEach(k=>localStorage.removeItem(k));
+}
+
 async function measureStorage(){
   const el=document.getElementById('storage-display');
   if(!el)return;
   el.textContent='Measuring...';
-  // Get quota via Storage API
-  let usedMB='?',quotaMB='?',pct=0;
+  // Get quota via Storage API -- kept only as a secondary, clearly-labeled
+  // figure. On iOS Safari this reflects the modern Storage API's own quota
+  // (mostly the service worker's app-shell cache), NOT localStorage's real,
+  // separate, much smaller ceiling -- localStorage has historically been
+  // capped independently by WebKit (commonly ~5-10MB, observed to vary by
+  // device/iOS version) and isn't visible through this API at all. Showing
+  // "0% used" here while actually nearing localStorage's real wall is
+  // actively misleading, which is why the localStorage total below is now
+  // the headline figure instead.
+  let usedMB='?',quotaMB='?';
   try{
     const est=await navigator.storage.estimate();
     usedMB=(est.usage/1048576).toFixed(1);
     quotaMB=(est.quota/1048576).toFixed(0);
-    pct=Math.round(est.usage/est.quota*100);
   }catch{}
   // Break down by category + key count
   const cats={options:0,history:0,snap:0,news:0,other:0};
@@ -212,15 +300,24 @@ async function measureStorage(){
   const fmt=b=>(b/1024).toFixed(0)+'KB';
   const totalLS=Object.values(cats).reduce((a,b)=>a+b,0);
   const totalKeys=localStorage.length;
-  el.innerHTML='<div style="margin-bottom:4px">Storage API: <b>'+usedMB+'MB</b> / '+quotaMB+'MB ('+pct+'%)</div>'
-    +'<div style="background:var(--bg2);border-radius:4px;height:6px;margin-bottom:6px"><div style="background:var(--accent);height:6px;border-radius:4px;width:'+Math.min(pct,100)+'%"></div></div>'
-    +'<div style="color:var(--text3);margin-bottom:4px">localStorage: '+totalKeys+' keys total</div>'
+  // Prefer a real measured capacity for this device if one exists; fall
+  // back to the generic, clearly-labeled estimate otherwise.
+  const measured=S.get('_storage_capacity_kb');
+  const budgetKB=measured?.kb||5120;
+  const budgetLabel=measured
+    ?'measured '+(measured.kb/1024).toFixed(1)+'MB capacity for this device (tested '+measured.measuredAt+')'
+    :'a typical ~'+(budgetKB/1024)+'MB budget (estimate, not measured on this device -- see "Measure Real Storage Limit" below)';
+  const lsPct=Math.min(Math.round(totalLS/1024/budgetKB*100),100);
+  const lsBarColor=lsPct>=90?'var(--red)':lsPct>=70?'var(--warn)':'var(--accent)';
+  el.innerHTML='<div style="margin-bottom:4px">localStorage: <b>'+fmt(totalLS)+'</b> ('+totalKeys+' keys) -- roughly '+lsPct+'% of '+budgetLabel+'</div>'
+    +'<div style="background:var(--bg2);border-radius:4px;height:6px;margin-bottom:4px"><div style="background:'+lsBarColor+';height:6px;border-radius:4px;width:'+lsPct+'%"></div></div>'
+    +(measured?'':'<div style="color:var(--text3);font-size:9px;margin-bottom:8px">iOS Safari doesn\'t report localStorage\'s real limit -- this budget is an estimate, not a confirmed number. Actual ceilings vary by device/iOS version.</div>')
     +'<div>Options chains: '+fmt(cats.options)+' ('+keyCounts.options+' keys)</div>'
     +'<div>Price history: '+fmt(cats.history)+' ('+keyCounts.history+' keys)</div>'
     +'<div>Ticker snaps: '+fmt(cats.snap)+' ('+keyCounts.snap+' keys)</div>'
     +'<div>News: '+fmt(cats.news)+' ('+keyCounts.news+' keys)</div>'
     +'<div>Other: '+fmt(cats.other)+' ('+keyCounts.other+' keys)</div>'
-    +'<div style="margin-top:4px;color:var(--text2)">Total localStorage: '+fmt(totalLS)+'</div>';
+    +'<div style="margin-top:8px;color:var(--text3);font-size:9px">Storage API (app shell + service worker cache, separate from localStorage): '+usedMB+'MB / '+quotaMB+'MB</div>';
 }
 
 async function workerHealthCheck(){
@@ -277,6 +374,60 @@ function _populateCutoffSelect(){
   sel.innerHTML=etHours.map(h=>`<option value="${h}"${h===savedET?' selected':''}>${etToDisplay(h)}</option>`).join('');
 }
 
+// Populate the state dropdown (Income tab tax-equivalent yield setting).
+// Options built from US_STATES (income.js) rather than hand-written here,
+// so there's one list to keep in sync, not two.
+function _populateTaxStateSelect(){
+  const sel=document.getElementById('tax-state-sel');
+  if(!sel||typeof US_STATES==='undefined')return;
+  const current=getTaxState();
+  sel.innerHTML=US_STATES.map(s=>{
+    const label=isNoIncomeTaxState(s)?s+' (no income tax)':s;
+    return`<option value="${s}"${s===current?' selected':''}>${label}</option>`;
+  }).join('');
+}
+
+// ── FOMC meeting dates (Fed Funds Futures probability breakdown, Market tab) ──
+// Self-service editing for exactly the scenario where nobody's available to
+// push a code update -- the Fed publishes these on its own site once a
+// year, so anyone can copy the 8 new dates in by hand. See
+// _effectiveFomcDates() in market.js for how a saved override here takes
+// over from the built-in list.
+function _renderFomcDatesEditor(){
+  const ta=document.getElementById('fomc-dates-textarea');
+  if(!ta||typeof _effectiveFomcDates!=='function')return;
+  ta.value=_effectiveFomcDates().join('\n');
+}
+function saveFomcDates(){
+  const ta=document.getElementById('fomc-dates-textarea');
+  if(!ta)return;
+  const lines=ta.value.split('\n').map(l=>l.trim()).filter(l=>l.length);
+  const valid=[],invalid=[];
+  lines.forEach(l=>{
+    // Strictly YYYY-MM-DD -- matches the format used throughout the rest
+    // of the app, and avoids ambiguous MM/DD vs DD/MM parsing.
+    if(/^\d{4}-\d{2}-\d{2}$/.test(l)&&!isNaN(new Date(l+'T12:00:00Z').getTime()))valid.push(l);
+    else invalid.push(l);
+  });
+  if(invalid.length){
+    toast('Not saved -- '+invalid.length+' line(s) not in YYYY-MM-DD format: '+invalid.slice(0,3).join(', ')+(invalid.length>3?'...':''),5000);
+    return;
+  }
+  if(!valid.length){
+    toast('Not saved -- list is empty. Use Reset to Defaults to start over.',4000);
+    return;
+  }
+  const deduped=[...new Set(valid)].sort();
+  S.set('fomc_meeting_dates_override',deduped);
+  ta.value=deduped.join('\n');
+  toast('FOMC meeting dates saved ('+deduped.length+' dates)',3000);
+}
+function resetFomcDatesToDefault(){
+  S.del('fomc_meeting_dates_override');
+  _renderFomcDatesEditor();
+  toast('Reset to built-in defaults',2500);
+}
+
 function openSettings(){
   document.getElementById('finnhub-key-input').value=FINNHUB_KEY;
   document.getElementById('worker-fragment-settings-input').value=S.get('worker_fragment')||'';
@@ -290,6 +441,9 @@ function openSettings(){
   document.getElementById('font-size-input').value=fontSize;
   loadWeightSliders();
   _populateCutoffSelect();
+  _populateTaxStateSelect();
+  _renderFomcDatesEditor();
+  document.getElementById('state-tax-rate-input').value=getStateTaxRatePct();
   document.getElementById('settings-overlay').classList.add('open');
 }
 
@@ -409,6 +563,8 @@ const EXPORT_KEYS_STATIC=[
   'income_accounts_meta','income_active_account','income_migration_v1',
   'debug_options_fetch','prefetch_sleep_ms','fetch_upgrades_enabled',
   'dashboard_notes','bb_gap_overlay','gap_list_filter',
+  'tax_state','state_tax_rate',
+  'fomc_meeting_dates_override',
 ];
 
 function _buildExportData(){

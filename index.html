@@ -657,6 +657,12 @@
     <div class="guide-h3">Data Sources</div>
     <div class="guide-kv"><span class="guide-key">Finnhub</span><span class="guide-val">Quotes, fundamentals, earnings calendar, analyst recommendations, price targets, news. Free tier: 60 calls/minute.</span></div>
     <div class="guide-kv"><span class="guide-key">Yahoo Finance</span><span class="guide-val">Price history, options chains, VIX, indices, T-bill yields, quoteSummary (PE, EPS, short interest, forward estimates). Accessed via your Cloudflare Worker proxy.</span></div>
+    <div class="guide-h3">Fed Funds Futures &amp; Meeting Odds</div>
+    <div class="guide-kv"><span class="guide-key">What it is</span><span class="guide-val">The Market tab's Fed Funds Futures card includes a per-meeting probability breakdown (e.g. "Sep 16: 72% hold, 28% cut 25bp") below the raw implied-rate table -- an estimate of what the futures market is pricing in for each upcoming FOMC decision, not just a single implied-rate number.</span></div>
+    <div class="guide-kv"><span class="guide-key">How it's calculated</span><span class="guide-val">Each 30-Day Fed Funds futures contract's price implies an average rate for its whole calendar month. Since a meeting doesn't fall on day 1, that average blends the known pre-meeting rate with the unknown post-meeting rate, weighted by days before/after the meeting date. Solving for the post-meeting rate and comparing it to the pre-meeting rate gives a probability split across hold / cut 25bp / hike 25bp. Meetings are solved in chronological order, each using the prior meeting's solved rate as its own starting point -- not treated independently.</span></div>
+    <div class="guide-kv"><span class="guide-key">Data source &amp; validity</span><span class="guide-val">Built entirely from the same 30-Day Fed Funds futures prices (Yahoo, via your Worker) already used for the implied-rate table above it -- not scraped from CME's own FedWatch tool, which is a paid, licensed product. The day-weighted-average technique is the same standard, publicly documented method CME's own methodology is built on. This is an independent calculation from public data, not a reproduction of CME's proprietary numbers, and may not exactly match CME's own published probabilities.</span></div>
+    <div class="guide-kv"><span class="guide-key">Simplification</span><span class="guide-val">Assumes the market prices in at most one 25bp step per meeting -- correct the large majority of the time, since that's how the Fed normally moves. If the market is genuinely pricing real odds of a 50bp move, this shows as a probability capped at 100% in one direction rather than splitting across three outcomes -- a visible sign to treat that specific reading with more skepticism, not a silent wrong answer.</span></div>
+    <div class="guide-kv"><span class="guide-key">FOMC meeting dates</span><span class="guide-val">The calculation needs the exact day of each meeting to correctly split "before" vs "after" days within its contract's month -- get the date wrong and the whole split is wrong for that meeting. Dates are maintained in Settings → FOMC Meeting Dates (built in through Jan 2028; the Fed announces each new year's schedule about a year ahead, usually Aug/Sep, at <a href="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">federalreserve.gov</a>). If a meeting's date is missing from the list, that meeting simply doesn't appear in the breakdown -- the raw implied-rate table above keeps working regardless, only the probability split fades out one meeting at a time as dates run out, never showing something wrong.</span></div>
   </div>
 </div>
 
@@ -684,7 +690,7 @@
   </div>
   <div class="gs-body" id="gb-income">
     <div class="guide-kv"><span class="guide-key">Blended yield</span><span class="guide-val">Weighted average of all three layers based on your capital allocation. Shows what your total portfolio is earning on an annualized basis.</span></div>
-    <div class="guide-kv"><span class="guide-key">Tax-equivalent yield</span><span class="guide-val">T-bill and money market yields are state-tax-exempt. The app grosses these up by your state tax rate (defaulting to California) so they are comparable to taxable yields on an after-tax basis.</span></div>
+    <div class="guide-kv"><span class="guide-key">Tax-equivalent yield</span><span class="guide-val">T-bill and money market yields are state-tax-exempt. The app grosses these up using your state and marginal tax rate, set in Settings (defaults to California, 9.3% -- change it if you're in a different state or bracket). No lookup table -- enter your own known rate, since it depends on your specific income and filing status. States with no income tax zero this out automatically.</span></div>
     <div class="guide-kv"><span class="guide-key">MMF yields</span><span class="guide-val">FDLXX and SPAXX/FDRXX 7-day yields are fetched from Yahoo Finance and cached per account. Tap Refresh Yields to update. Layer 2 ETF yields come from the ETF tab — refresh the ETF tab if SPYI or NBOS shows no yield.</span></div>
     <div class="guide-kv"><span class="guide-key">Layer 3 capital</span><span class="guide-val">Your active put and covered call positions feed into the Layer 3 denominator as deployed notional capital. The blended yield calculation uses actual position notional, not a flat allocation.</span></div>
     <div class="guide-kv"><span class="guide-key">Position tracker</span><span class="guide-val">Log each put and covered call with strike, premium, expiration, and DTE. The tracker shows annualized APY per position and tracks lifecycle (open → approaching expiry → expired).</span></div>
@@ -736,6 +742,9 @@
     <div class="input-group"><label class="input-label">Font Size</label><select class="input" id="font-size-input"><option value="15">Small (15px)</option><option value="17">Medium (17px)</option><option value="19" selected>Default (19px)</option><option value="21">Large (21px)</option><option value="23">Extra Large (23px)</option><option value="26">2XL (26px)</option><option value="30">3XL (30px)</option><option value="36">4XL (36px)</option></select></div>
     <div class="input-group"><label class="input-label">Timestamp Display</label><select class="input" id="tz-pref-input"><option value="PT">Pacific Time (PT) -- home timezone</option><option value="local">Local Device Time</option><option value="UTC">UTC / GMT</option></select></div>
     <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:12px;line-height:1.6">All timestamps throughout the app will use this timezone. Relative age (e.g. "3h ago") is always shown alongside.</div>
+    <div class="input-group"><label class="input-label">State (for tax-equivalent yield)</label><select class="input" id="tax-state-sel" onchange="setTaxState()"></select></div>
+    <div class="input-group"><label class="input-label">Your Marginal State Tax Rate (%)</label><input class="input" type="number" id="state-tax-rate-input" min="0" max="100" step="0.1" onchange="setStateTaxRate()"></div>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:12px;line-height:1.6">Used to gross up T-bill and FDLXX yields to their tax-equivalent value on the Income tab, since both are exempt from state income tax. Enter your own known marginal rate -- this isn't looked up automatically, since your actual rate depends on your specific income and filing status. Selecting a state with no income tax zeroes the rate automatically (still editable).</div>
     <div class="input-group"><label class="input-label">Options cache write cutoff</label><select class="input" id="options-cutoff-input"></select></div>
     <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:12px;line-height:1.6">After this time, existing same-day options cache is preserved rather than overwritten with potentially synthetic after-hours data.</div>
     <div class="input-group" style="display:flex;align-items:center;justify-content:space-between">
@@ -934,6 +943,14 @@
     <button class="btn btn-secondary" onclick="openDataPortabilityModal()" style="width:100%;margin-bottom:6px">Export / Import App Data</button>
     <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:12px;line-height:1.5">Export your positions, earnings overrides, income inputs, and settings to a portable JSON backup. Import a previous backup to restore.</div>
     <hr class="divider">
+    <div class="card-title" style="margin-bottom:10px"><span class="dot" style="background:var(--accent2)"></span>FOMC Meeting Dates</div>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px;line-height:1.6">Used by the Fed Funds Futures meeting-by-meeting odds on the Market tab (see Guide for how). One date per line, YYYY-MM-DD, the second day of each meeting (when the rate decision is announced). The Fed publishes next year's dates about once a year, usually Aug/Sep, at <a href="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">federalreserve.gov/monetarypolicy/fomccalendars.htm</a> -- copy the new ones in here if this hasn't been updated in a while.</div>
+    <textarea id="fomc-dates-textarea" style="width:100%;height:140px;font-family:var(--mono);font-size:10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;resize:none;box-sizing:border-box;margin-bottom:8px" placeholder="2026-01-28"></textarea>
+    <div style="display:flex;gap:6px">
+      <button class="btn btn-secondary" style="flex:1;font-size:11px" onclick="saveFomcDates()">Save</button>
+      <button class="btn btn-secondary" style="flex:1;font-size:11px" onclick="resetFomcDatesToDefault()">Reset to Defaults</button>
+    </div>
+    <hr class="divider">
     <div class="card-title" style="margin-bottom:10px"><span class="dot" style="background:var(--danger)"></span>Danger Zone</div>
     <button class="btn btn-secondary" onclick="clearMarketDataCache()" style="margin-bottom:8px;width:100%">Clear Market Data Cache</button>
     <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px;line-height:1.5">Clears options chains, price history, and ticker snapshots only. Preserves your watchlist, positions, earnings overrides, income inputs, and all settings.</div>
@@ -942,6 +959,8 @@
       <div class="card-title" style="font-size:12px;margin-bottom:6px"><span class="dot" style="background:var(--accent3)"></span>Storage Usage</div>
       <div id="storage-display" style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.6">Tap Measure to see usage</div>
       <button class="btn btn-secondary" onclick="measureStorage()" style="margin-top:6px;width:100%">Measure Storage</button>
+      <button class="btn btn-secondary" id="storage-capacity-test-btn" onclick="measureRealStorageCapacity()" style="margin-top:6px;width:100%">Measure Real Storage Limit (optional, ~1 sec)</button>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:4px">Writes and deletes temporary throwaway data to find this device's actual localStorage ceiling, since iOS Safari doesn't report it directly. Safe -- never touches your real data. Result is saved on this device only, not included in exports.</div>
     </div>
     <div style="margin-top:12px">
       <div class="card-title" style="font-size:12px;margin-bottom:6px"><span class="dot" style="background:var(--green)"></span>Worker Health Check</div>
@@ -1192,7 +1211,14 @@ v1.7 -- 2026-04-29
       <input class="input" type="text" id="worker-fragment-input" placeholder="the address you were given" autocapitalize="off" autocorrect="off" spellcheck="false">
     </div>
     <div id="worker-setup-status" style="font-family:var(--mono);font-size:11px;color:var(--text2);margin-bottom:10px;min-height:14px"></div>
-    <button class="btn btn-primary" id="worker-setup-continue-btn" onclick="submitWorkerFragment()">Continue</button>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.6;background:var(--surface2);border-radius:8px;padding:10px;margin-bottom:12px">
+      This app is for informational and educational purposes only -- not financial, investment, or trading advice. Options trading involves substantial risk of loss. The developer accepts no liability for losses arising from its use. <a href="javascript:void(0)" onclick="document.getElementById('disclaimer-modal').style.display='block'" style="color:var(--accent);text-decoration:underline">Read the full disclaimer</a>.
+    </div>
+    <label style="display:flex;align-items:flex-start;gap:8px;margin-bottom:14px;font-family:var(--mono);font-size:11px;color:var(--text2);cursor:pointer">
+      <input type="checkbox" id="worker-setup-disclaimer-check" onchange="_updateWorkerSetupContinueState()" style="margin-top:2px;flex-shrink:0">
+      <span>I understand this is not financial advice and I'm using this app at my own risk.</span>
+    </label>
+    <button class="btn btn-primary" id="worker-setup-continue-btn" onclick="submitWorkerFragment()" disabled>Continue</button>
     <button class="btn btn-secondary" id="worker-setup-cancel-btn" style="display:none" onclick="cancelWorkerFragmentCheck()">Cancel</button>
   </div>
 </div>
@@ -1469,12 +1495,23 @@ function _setWorkerSetupStatus(msg,isError){
   el.textContent=msg;
   el.style.color=isError?'var(--danger)':'var(--text2)';
 }
+function _updateWorkerSetupContinueState(){
+  const check=document.getElementById('worker-setup-disclaimer-check');
+  const continueBtn=document.getElementById('worker-setup-continue-btn');
+  if(check&&continueBtn)continueBtn.disabled=!check.checked;
+}
 function openWorkerSetupOverlay(){
   const input=document.getElementById('worker-fragment-input');
   if(input)input.value=S.get('worker_fragment')||'';
   _setWorkerSetupStatus('');
   document.getElementById('worker-setup-cancel-btn').style.display='none';
-  document.getElementById('worker-setup-continue-btn').disabled=false;
+  // Both call sites (true first launch, and after "Clear All Cached Data")
+  // are genuine fresh-start moments -- the checkbox resets unchecked and
+  // Continue starts disabled every time this modal opens, not just once
+  // ever, so a full reset also means a fresh acknowledgment.
+  const check=document.getElementById('worker-setup-disclaimer-check');
+  if(check)check.checked=false;
+  document.getElementById('worker-setup-continue-btn').disabled=true;
   document.getElementById('worker-setup-overlay').classList.add('open');
 }
 function cancelWorkerFragmentCheck(){
@@ -1484,6 +1521,8 @@ function cancelWorkerFragmentCheck(){
   if(_workerSetupAbortCtrl)_workerSetupAbortCtrl.abort('user-cancel');
 }
 async function submitWorkerFragment(){
+  const check=document.getElementById('worker-setup-disclaimer-check');
+  if(check&&!check.checked){_setWorkerSetupStatus('Please check the box above to continue.',true);return;}
   const raw=document.getElementById('worker-fragment-input').value;
   const fragment=_normalizeWorkerFragment(raw);
   if(!fragment){_setWorkerSetupStatus('Enter a value before continuing.',true);return;}
@@ -1544,6 +1583,20 @@ function init(){
   // it naturally stops matching anything once enough real time has passed.
   // Safe to call every init.
   try{ purgeContaminatedConfirmedEarnings(); }catch(e){ console.error('Confirmed-earnings purge error:',e); }
+  // Startup safety net for the storage-capacity test (Settings): if it was
+  // ever interrupted before its own cleanup ran (e.g. app backgrounded
+  // mid-test), remove any leftover throwaway keys rather than letting them
+  // silently eat into real storage headroom. Safe to call every init --
+  // no-op if none exist.
+  try{ _cleanupStrayStorageTestKeys(); }catch(e){ console.error('Storage-test-key cleanup error:',e); }
+  // One-time (gated on the result key being absent, not a run-count flag,
+  // so it also naturally re-fires after a full "Clear All Cached Data"
+  // reset): measure this device's real localStorage ceiling while
+  // localStorage is still close to empty -- the cleanest possible baseline,
+  // before real ticker data accumulates and makes the same measurement
+  // less representative of the device's true capacity. Completes in ~1ms
+  // at realistic sizes (tested), so no perceptible startup delay.
+  try{ if(!S.get('_storage_capacity_kb'))measureRealStorageCapacity(); }catch(e){ console.error('Initial storage-capacity measurement error:',e); }
   // One-time cleanup: remove orphaned flat income position keys left over from
   // pre-migration state. Safe to call every init -- S.del is a no-op if key absent.
   // Only runs when migration is already complete (flag set) and accounts exist.
