@@ -239,9 +239,20 @@ function _openPositionsModal(ticker){
         (itm?' <span style="color:var(--warn);font-size:9px">⚠ ITM</span>':'')+
       '</div>';
     }).join('');
-    const putNotional=puts.reduce((s,p)=>s+p.strike*100*p.contracts,0);
-    const ccNotional=ccs.reduce((s,p)=>s+p.strike*100*p.contracts,0);
+    const putNotional=puts.filter(p=>_posExpiryStatusWL(p)!=='expired-linger').reduce((s,p)=>s+p.strike*100*p.contracts,0);
+    const ccNotional=ccs.filter(p=>_posExpiryStatusWL(p)!=='expired-linger').reduce((s,p)=>s+p.strike*100*p.contracts,0);
     const totalNotional=putNotional+ccNotional;
+    // Expired-but-still-listed positions ('expired-linger' -- shown for up
+    // to 7 days after expiry so there's a chance to review/clean them up,
+    // see _posExpiryStatusWL) are excluded from the notional totals above:
+    // an already-expired contract is no longer a live commitment, so
+    // counting it toward "how much is currently at risk" would overstate
+    // it. Still shown in the rows below (dimmed), just not summed here --
+    // this note makes that split explicit rather than silent.
+    const expiredCount=[...puts,...ccs].filter(p=>_posExpiryStatusWL(p)==='expired-linger').length;
+    const expiredNote=expiredCount>0
+      ?'<div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-bottom:4px">'+expiredCount+' expired position'+(expiredCount>1?'s':'')+' shown below, excluded from the totals above</div>'
+      :'';
     const notionalLine=totalNotional>0
       ?'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:6px;display:flex;gap:10px">'+
           (putNotional>0?'<span>Puts: <span style="color:var(--text2)">$'+putNotional.toLocaleString()+'</span></span>':'')+
@@ -256,7 +267,7 @@ function _openPositionsModal(ticker){
           'style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text3);cursor:pointer">'+
           'Go to account ↗</button>'+
       '</div>'+
-      notionalLine+putRows+ccRows+
+      notionalLine+expiredNote+putRows+ccRows+
     '</div>';
   }).join('');
 
@@ -816,13 +827,14 @@ function renderWatchlist(){
     const volBadge=_volBadgeHtml(_checkVolumeBadge(t));
     const ivrBadge=_ivrBadgeHtml(t);
     const rsiTransBadge=_rsiTransitionBadgeHtml(t);
+    const distBadge=_distBadgeHtml(t);
     const gapBadge=_gapBadgeHtml(t);
     const note=S.get('watchlist_note_'+t)||'';
     const expanded=_expandedNotes.has(t);
     return '<div class="watchlist-item" style="flex-direction:column;align-items:stretch;'+bgStyle+'" onclick="navigateToTicker(\''+t+'\')">'+
       '<div style="display:flex;align-items:center;justify-content:space-between;width:100%">'+
         '<div style="min-width:0;flex-shrink:1">'+
-          '<div class="watchlist-ticker">'+t+ivrBadge+volBadge+'</div>'+
+          '<div class="watchlist-ticker">'+t+ivrBadge+volBadge+distBadge+'</div>'+
           (c?'<div class="watchlist-ts">'+c.ts+(age?' ('+age+')':'')+'</div>':'')+
         '</div>'+
         '<div style="flex:1;display:flex;align-items:center;justify-content:center;padding:0 8px">'+
@@ -865,11 +877,6 @@ function addTicker(){
   if(watchlist.includes(t)){toast(t+' already in watchlist');return;}
   watchlist.push(t);S.set('watchlist',watchlist);
   inp.value='';renderWatchlist();populateSelects();toast('Added '+t);
-}
-
-function removeTicker(e,t){
-  e.stopPropagation();
-  _openRemoveModal(t);
 }
 
 function populateSelects(){

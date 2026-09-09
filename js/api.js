@@ -87,16 +87,25 @@ async function yahooOptionsViaProxy(symbol,expiration){
 }
 
 async function fetchQuoteSummary(symbol){
-  // Single call fetching 5 quoteSummary modules:
+  // Single call fetching 6 quoteSummary modules:
   // financialData: price targets, margins, growth
   // defaultKeyStatistics: PEG, EV/EBITDA, short interest, beta
   // earningsTrend: EPS/revenue estimates by period + revision direction
   // recommendationTrend: buy/hold/sell counts by month (Yahoo free, vs Finnhub premium)
   // earningsHistory: past actual-vs-estimate EPS + surprise (replaces Finnhub /stock/earnings)
+  // assetProfile: sector/industry classification -- null for ETFs/mutual funds/indices,
+  // which aren't individual companies and have no sector of their own
   if(offlineMode)return null;
   try{
-    const modules='financialData,defaultKeyStatistics,earningsTrend,recommendationTrend,earningsHistory';
-    const r=await fetch(`${WORKER_URL}/?ticker=${encodeURIComponent(symbol)}&type=summary&modules=${encodeURIComponent(modules)}`);
+    const modules='financialData,defaultKeyStatistics,earningsTrend,recommendationTrend,earningsHistory,assetProfile';
+    // Cache-bust: every other Yahoo fetch in this file (history, options,
+    // quote, even the sibling type=summary&modules=topHoldings call below)
+    // includes _t=Date.now() specifically because an identical URL is a
+    // prime target for stale caching at the browser or Cloudflare layer.
+    // This call was the one exception -- missing since before this
+    // session -- which meant earningsTrend/earningsHistoryYahoo could be
+    // served from a stale response indefinitely, with no way to tell.
+    const r=await fetch(`${WORKER_URL}/?ticker=${encodeURIComponent(symbol)}&type=summary&modules=${encodeURIComponent(modules)}&_t=${Date.now()}`);
     if(!r.ok)return null;
     const d=await r.json();
     const res=d.quoteSummary?.result?.[0];
@@ -106,7 +115,13 @@ async function fetchQuoteSummary(symbol){
     const et=res.earningsTrend?.trend||[];
     const rt=res.recommendationTrend?.trend||[];
     const eh=res.earningsHistory?.history||[];
+    const ap=res.assetProfile||{};
     return{
+      // Sector/industry classification (assetProfile) -- for grouping
+      // valuation comparisons among similar companies, not raw across
+      // unrelated sectors
+      sector:ap.sector||null,
+      industry:ap.industry||null,
       // Price targets (financialData)
       ptMean:fd.targetMeanPrice?.raw||null,
       ptHigh:fd.targetHighPrice?.raw||null,
@@ -135,7 +150,13 @@ async function fetchQuoteSummary(symbol){
         revenueAvg:p.revenueEstimate?.avg?.raw||null,
         epsRevUp:p.earningsEstimate?.numberOfAnalystsWithEstimate?.raw||null,
         growth:p.growth?.raw||null,
-        endDate:p.endDate
+        // Unlike every other field above, nothing previously read endDate,
+        // so it was left as Yahoo's raw {raw,fmt} wrapper object -- taken
+        // bare it stringifies to "[object Object]" wherever compared as a
+        // date. Unwrapped the same way earningsHistoryYahoo's own date
+        // field already is, below. Defensive fallback to a bare string in
+        // case some Yahoo responses ever send it unwrapped.
+        endDate:p.endDate?.fmt||(p.endDate?.raw?fmtDate(new Date(p.endDate.raw*1000)):(typeof p.endDate==='string'?p.endDate:null))
       })),
       // Recommendation trend (last 3 months)
       recTrend:rt.slice(0,3).map(m=>({
@@ -284,15 +305,24 @@ async function fetchFedFundsFutures(){
     const mo=now.getMonth(); // 0-indexed
     // Month codes for futures contracts
     const codes=['F','G','H','J','K','M','N','Q','U','V','X','Z'];
-    // Build tickers for next 6 months starting from current month
+    // Build tickers for the prior month plus the next 6, starting one
+    // month BEFORE the current one. The prior month exists specifically to
+    // supply a baseline rate when the current month itself is a meeting
+    // month with nothing meeting-free earlier in a forward-only window --
+    // e.g. Sep/Oct 2026 are back-to-back FOMC months, and once "now" rolls
+    // into September, a forward-only fetch has nothing before it to
+    // bootstrap from. Whether Yahoo still returns a usable settlement
+    // price for an already-expired CBT contract is genuinely untested;
+    // if it doesn't, this degrades to exactly the prior behavior (that
+    // month just lands in failedMonths, same as any other bad quote).
     const tickers=[];
-    for(let i=0;i<6;i++){
+    for(let i=-1;i<6;i++){
       const d=new Date(yr,mo+i,1);
       const y=d.getFullYear().toString().slice(2);
       const c=codes[d.getMonth()];
       tickers.push(`ZQ${c}${y}.CBT`);
     }
-    // Fetch quotes for all 6 contracts in parallel
+    // Fetch quotes for all 7 contracts in parallel
     const _fft=Date.now();
     const results=await Promise.all(tickers.map(t=>
       fetch(`${WORKER_URL}/?ticker=${encodeURIComponent(t)}&type=quote&_t=${_fft}`)
@@ -300,16 +330,18 @@ async function fetchFedFundsFutures(){
         .catch(()=>null)
     ));
     const contracts=[];
+    const failedMonths=[];
     results.forEach((d,i)=>{
+      const contractDate=new Date(yr,mo+i-1,1);
+      const monthLabel=contractDate.toLocaleDateString('en-US',{month:'short',year:'numeric'});
       const q=d?.quoteResponse?.result?.[0];
-      if(!q)return;
+      if(!q){failedMonths.push(monthLabel);return;}
       const price=q.regularMarketPrice||null;
-      if(!price||price<90)return; // sanity check -- valid futures are 95-100
+      if(!price||price<90){failedMonths.push(monthLabel);return;} // sanity check -- valid futures are 95-100
       const impliedRate=parseFloat((100-price).toFixed(3));
-      const contractDate=new Date(yr,mo+i,1);
       contracts.push({
         ticker:tickers[i],
-        month:contractDate.toLocaleDateString('en-US',{month:'short',year:'numeric'}),
+        month:monthLabel,
         price,
         impliedRate
       });
@@ -317,7 +349,13 @@ async function fetchFedFundsFutures(){
     if(!contracts.length)return null;
     // Compute implied cut/hike probabilities between consecutive months
     // Current effective fed funds rate from most recent contract or ^IRX
-    return contracts;
+    // failedMonths is surfaced (not silently dropped) specifically because
+    // a partial failure here looks identical to "there just weren't more
+    // meetings to show" otherwise -- any month whose contract simply
+    // didn't return usable data (a Yahoo quote hiccup, an illiquid
+    // far-dated CME contract, etc.) previously vanished from both this
+    // list and the meeting-probability breakdown with zero trace anywhere.
+    return{contracts,failedMonths};
   }catch{return null;}
 }
 

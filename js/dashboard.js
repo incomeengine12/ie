@@ -15,7 +15,7 @@ function setDashboardViewMode(mode){
 }
 
 function _syncDashboardViewModeUI(){
-  const putsBtn=document.getElementById('dash-view-puts'),ccBtn=document.getElementById('dash-view-cc'),rsiBtn=document.getElementById('dash-view-rsi'),riskBtn=document.getElementById('dash-view-risk'),gapBtn=document.getElementById('dash-view-gap'),notesBtn=document.getElementById('dash-view-notes'),wheelbtBtn=document.getElementById('dash-view-wheelbt');
+  const putsBtn=document.getElementById('dash-view-puts'),ccBtn=document.getElementById('dash-view-cc'),rsiBtn=document.getElementById('dash-view-rsi'),riskBtn=document.getElementById('dash-view-risk'),gapBtn=document.getElementById('dash-view-gap'),notesBtn=document.getElementById('dash-view-notes'),wheelbtBtn=document.getElementById('dash-view-wheelbt'),valuationBtn=document.getElementById('dash-view-valuation');
   if(putsBtn)putsBtn.style.opacity=dashboardViewMode==='puts'?'1':'0.4';
   if(ccBtn)ccBtn.style.opacity=dashboardViewMode==='cc'?'1':'0.4';
   if(rsiBtn)rsiBtn.style.opacity=dashboardViewMode==='rsi'?'1':'0.4';
@@ -23,6 +23,7 @@ function _syncDashboardViewModeUI(){
   if(gapBtn)gapBtn.style.opacity=dashboardViewMode==='gap'?'1':'0.4';
   if(notesBtn)notesBtn.style.opacity=dashboardViewMode==='notes'?'1':'0.4';
   if(wheelbtBtn)wheelbtBtn.style.opacity=dashboardViewMode==='wheelbt'?'1':'0.4';
+  if(valuationBtn)valuationBtn.style.opacity=dashboardViewMode==='valuation'?'1':'0.4';
 
   const convictionControls=document.getElementById('dash-conviction-controls');
   const putsCard=document.getElementById('dash-puts-card');
@@ -34,7 +35,8 @@ function _syncDashboardViewModeUI(){
   const notesCard=document.getElementById('dash-notes-card');
   const wheelbtCard=document.getElementById('dash-wheelbt-card');
   const wheelbtRankingCard=document.getElementById('dash-wheelbt-ranking-card');
-  if(convictionControls)convictionControls.style.display=(dashboardViewMode==='rsi'||dashboardViewMode==='risk'||dashboardViewMode==='gap'||dashboardViewMode==='notes'||dashboardViewMode==='wheelbt')?'none':'';
+  const valuationCard=document.getElementById('dash-valuation-card');
+  if(convictionControls)convictionControls.style.display=(dashboardViewMode==='rsi'||dashboardViewMode==='risk'||dashboardViewMode==='gap'||dashboardViewMode==='notes'||dashboardViewMode==='wheelbt'||dashboardViewMode==='valuation')?'none':'';
   if(putsCard)putsCard.style.display=dashboardViewMode==='puts'?'':'none';
   if(ccCard)ccCard.style.display=dashboardViewMode==='cc'?'':'none';
   if(rsiCard)rsiCard.style.display=dashboardViewMode==='rsi'?'':'none';
@@ -44,12 +46,14 @@ function _syncDashboardViewModeUI(){
   if(notesCard)notesCard.style.display=dashboardViewMode==='notes'?'':'none';
   if(wheelbtCard)wheelbtCard.style.display=dashboardViewMode==='wheelbt'?'':'none';
   if(wheelbtRankingCard)wheelbtRankingCard.style.display=dashboardViewMode==='wheelbt'?'':'none';
+  if(valuationCard)valuationCard.style.display=dashboardViewMode==='valuation'?'':'none';
 
   if(dashboardViewMode==='rsi'){_populateRSIBacktestDropdown();renderRSIBacktest();renderRSIRanking();}
   if(dashboardViewMode==='risk'){renderAssignmentRisk();}
   if(dashboardViewMode==='gap'){_populateGapFillDropdown();renderGapFillDashboard();}
   if(dashboardViewMode==='notes'){renderDashboardNotes();}
   if(dashboardViewMode==='wheelbt'){_populateWheelBacktestDropdown();if(!_wheelbtViewEverRendered||_wheelbtDataStale)setTimeout(refreshWheelBacktestViews,50);}
+  if(dashboardViewMode==='valuation'){renderValuationDashboard();}
 }
 
 // 9 component definitions split into two rows: 4 on top, 5 on bottom.
@@ -101,9 +105,10 @@ function renderDashTable(elId,results,ts,isLive){
     const sc=r.score!=null?r.score:'';
     const comps=r.components||{};
     const starLabel=starred.has(r.ticker)?'<span style="font-size:13px;color:#ffc107;margin-left:4px" title="Starred">&#9733;</span>':'';
+    const distBadge=_distBadgeHtml(r.ticker);
     return'<div style="background:'+bg+';border:1px solid '+bc+';border-left:4px solid '+bc+';border-radius:10px;padding:12px;margin-bottom:10px;cursor:pointer" onclick="navigateToTicker(\''+r.ticker+'\')">'
       +'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">'
-      +'<div><span style="font-family:var(--sans);font-size:18px;font-weight:700;color:var(--accent)">'+r.ticker+'</span>'+starLabel+(r.price?'<span style="font-family:var(--mono);font-size:13px;color:var(--text2);margin-left:8px">$'+r.price.toFixed(2)+'</span>':'')+'</div>'
+      +'<div><span style="font-family:var(--sans);font-size:18px;font-weight:700;color:var(--accent)">'+r.ticker+'</span>'+starLabel+distBadge+(r.price?'<span style="font-family:var(--mono);font-size:13px;color:var(--text2);margin-left:8px">$'+r.price.toFixed(2)+'</span>':'')+'</div>'
       +'<div style="text-align:right"><div style="font-family:var(--mono);font-size:11px;font-weight:600">'+r.signal.toUpperCase()+(sc!==''?' &middot; '+sc:'')+'</div>'+(r.ivrBadge||'')+'</div>'
       +'</div>'
       +renderCompBars(comps)
@@ -402,6 +407,145 @@ function renderAssignmentRisk(){
         <span>Time value: ${tvStr}</span>
       </div>
       ${earningsStr?`<div style="font-family:var(--mono);font-size:10px;margin-top:2px">${earningsStr}</div>`:''}
+    </div>`;
+  }).join('');
+}
+
+// ── Valuation view (sector-grouped P/E & PEG comparison) ────────────────────
+
+function getValuationScope(){
+  const s=S.get('valuation_scope');
+  return s==='starred'?s:'all';
+}
+// Metric definitions: key -> {label, snapField, decimals, secondary}.
+// "secondary" is which OTHER metric displays alongside the selected one in
+// each row -- chosen for what pairs most usefully, not just "whatever's
+// left": TTM/Forward paired together directly shows the growth
+// expectation implied by the gap between them (same read as the Ticker
+// page's "Earnings growth/shrinkage expected" note); PEG is paired with
+// Forward P/E specifically because Yahoo's PEG is itself forward-P/E-based
+// internally, so showing them together is the methodologically coherent
+// pairing, not trailing P/E.
+const VALUATION_METRICS={
+  pe:    {rowLabel:'P/E TTM', shortLabel:'TTM', snapField:'peRatio',   decimals:1, secondary:'pe_fwd'},
+  pe_fwd:{rowLabel:'P/E Fwd', shortLabel:'Fwd', snapField:'peForward', decimals:1, secondary:'pe'},
+  peg:   {rowLabel:'PEG',     shortLabel:'PEG', snapField:'pegRatio',  decimals:2, secondary:'pe_fwd'},
+};
+function _fmtValuationMetric(key,val){
+  if(val==null)return'N/A';
+  return val.toFixed(VALUATION_METRICS[key].decimals);
+}
+
+function getValuationMetric(){
+  const m=S.get('valuation_metric');
+  return VALUATION_METRICS[m]?m:'pe';
+}
+function setValuationScope(scope){
+  S.set('valuation_scope',scope);
+  renderValuationDashboard();
+}
+function setValuationMetric(metric){
+  S.set('valuation_metric',metric);
+  renderValuationDashboard();
+}
+
+function renderValuationDashboard(){
+  const content=document.getElementById('valuation-content');
+  if(!content)return;
+  const scope=getValuationScope();
+  const metric=getValuationMetric();
+  // Sync toggle button visuals to the persisted preference -- this view's
+  // choices survive reloads (unlike the Wheel Backtest ranking filter,
+  // which intentionally resets every load), so the buttons need to catch
+  // up to a stored non-default value on a fresh render, not just when
+  // clicked.
+  const allBtn=document.getElementById('valuation-scope-all'),starBtn=document.getElementById('valuation-scope-starred');
+  if(allBtn){allBtn.style.background=scope==='all'?'var(--accent)':'var(--surface3)';allBtn.style.color=scope==='all'?'#000':'var(--text3)';}
+  if(starBtn){starBtn.style.background=scope==='starred'?'var(--accent)':'var(--surface3)';starBtn.style.color=scope==='starred'?'#000':'var(--text3)';}
+  Object.keys(VALUATION_METRICS).forEach(k=>{
+    const btn=document.getElementById('valuation-metric-'+k);
+    if(btn){btn.style.background=metric===k?'var(--accent)':'var(--surface3)';btn.style.color=metric===k?'#000':'var(--text3)';}
+  });
+
+  const starred=scope==='starred'?_starredTickers():null;
+  const tickers=starred?watchlist.filter(t=>starred.has(t)):watchlist;
+  if(!tickers.length){
+    content.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>'+(starred?'No starred tickers yet -- tap the star on a ticker in the Watchlist tab to add one.':'Watchlist is empty')+'</div>';
+    return;
+  }
+
+  // Group by sector -- tickers with no sector (ETFs, mutual funds, or not
+  // yet prefetched) land in their own explicit bucket rather than
+  // disappearing silently.
+  const NO_SECTOR='No sector data';
+  const groups={};
+  tickers.forEach(t=>{
+    const snap=S.get('snap_'+t)||{};
+    const sector=snap.sector||NO_SECTOR;
+    if(!groups[sector])groups[sector]=[];
+    groups[sector].push({
+      ticker:t,
+      price:snap.price??null,
+      pe:snap.peRatio??null,
+      pe_fwd:snap.peForward??null,
+      peg:snap.pegRatio??null,
+      // Only PEG is currently tracked for staleness here -- P/E (TTM) and
+      // P/E (Forward) come from the separate quote endpoint, not
+      // quoteSummary, and aren't covered by this preservation fix yet.
+      pegStale:!!snap.summaryDegraded,
+    });
+  });
+
+  const sectorNames=Object.keys(groups).filter(s=>s!==NO_SECTOR).sort();
+  if(groups[NO_SECTOR])sectorNames.push(NO_SECTOR); // always last
+
+  const metricKey=metric;
+  const metricLabel=VALUATION_METRICS[metric].rowLabel;
+  const secondaryKey=VALUATION_METRICS[metric].secondary;
+  const secondaryLabel=VALUATION_METRICS[secondaryKey].shortLabel;
+
+  // Staleness note: only relevant when PEG is actually visible somewhere on
+  // screen right now (as the primary metric -- PEG never appears as a
+  // secondary value, per the pairing rules above), and only counts
+  // currently-in-view tickers, not the whole watchlist.
+  const staleTickers=tickers.filter(t=>{
+    const snap=S.get('snap_'+t)||{};
+    return snap.summaryDegraded&&snap.pegRatio!=null;
+  });
+  const staleNote=(metric==='peg'&&staleTickers.length)
+    ?`<div style="font-family:var(--mono);font-size:10px;color:#64b5f6;margin-bottom:10px;padding:6px 8px;background:rgba(100,181,246,0.1);border-radius:6px">&#x25D1; PEG for ${staleTickers.length} ticker${staleTickers.length===1?'':'s'} below is from an earlier fetch, not this one (quoteSummary didn't come through last refresh) -- marked with &#x25D1; next to the value.</div>`
+    :'';
+
+  content.innerHTML=staleNote+sectorNames.map(sector=>{
+    const rows=groups[sector];
+    // Within each sector: sort by the selected metric ascending: tickers
+    // missing that specific metric (common for the No sector data bucket,
+    // and for unprofitable companies with no meaningful trailing P/E) sink
+    // to the bottom of their own group rather than mixing in as if they
+    // were the "cheapest" -- a missing value is not a low value.
+    const sorted=[...rows].sort((a,b)=>{
+      const av=a[metricKey],bv=b[metricKey];
+      if(av==null&&bv==null)return a.ticker.localeCompare(b.ticker);
+      if(av==null)return 1;
+      if(bv==null)return -1;
+      return av-bv;
+    });
+    const countNote=rows.length===1?' <span style="color:var(--text3);font-weight:400">(1 ticker -- no in-watchlist comparison)</span>':'';
+    const rowsHtml=sorted.map(r=>{
+      const valStr=_fmtValuationMetric(metricKey,r[metricKey]);
+      const otherStr=_fmtValuationMetric(secondaryKey,r[secondaryKey]);
+      const priceStr=r.price!=null?'$'+r.price.toFixed(2):'N/A';
+      const staleMark=(metricKey==='peg'&&r.pegStale&&r.peg!=null)?' <span style="color:#64b5f6" title="From an earlier fetch, not this one">&#x25D1;</span>':'';
+      return`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--surface3)">
+        <span style="font-family:var(--mono);font-size:12px;font-weight:600;cursor:pointer" onclick="navigateToTicker('${r.ticker}')">${r.ticker}</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--text3)">${priceStr}</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--text3)">${secondaryLabel} ${otherStr}</span>
+        <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--accent)">${metricLabel} ${valStr}${staleMark}</span>
+      </div>`;
+    }).join('');
+    return`<div style="margin-bottom:14px">
+      <div style="font-family:var(--sans);font-size:11px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px">${sector}${countNote}</div>
+      ${rowsHtml}
     </div>`;
   }).join('');
 }
