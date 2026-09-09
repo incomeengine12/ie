@@ -1,5 +1,29 @@
 // Income Engine -- options.js
 
+// Determines which upcoming FOMC meetings have an "expected" (i.e. more
+// likely than not) hike or cut, per the Market tab's meeting-odds
+// calculation -- meetings expected to hold are deliberately excluded here,
+// not just de-emphasized, since the whole point of this warning is to flag
+// meetings where a real rate move is more likely than not. Since the
+// underlying model only ever produces two nonzero outcomes per meeting
+// (hold plus at most one of cut/hike, mutually exclusive, summing to
+// 100%), "expected" here simply means whichever of the two is larger.
+// Reads from the Fed Funds Futures data the Market tab already cached
+// (fed_futures) -- no separate fetch, and gracefully returns nothing if
+// the Market tab has never been loaded.
+function _getQualifyingFomcMeetings(){
+  const cf=S.get('fed_futures');
+  const fedFutures=cf?.data||null;
+  if(!fedFutures||typeof _computeFedMeetingProbabilities!=='function')return[];
+  let meetings=[];
+  try{meetings=_computeFedMeetingProbabilities(fedFutures)||[];}catch{return[];}
+  return meetings.map(m=>{
+    const direction=m.pCut25>m.pHold?'cut':m.pHike25>m.pHold?'hike':null;
+    if(!direction)return null;
+    return{meetingDate:m.meetingDate,direction,pct:direction==='cut'?m.pCut25:m.pHike25};
+  }).filter(Boolean);
+}
+
 // Validate options data before caching -- rejects synthetic/after-hours placeholder data.
 // Yahoo returns geometric IV values (50%, 25%, 12.5%...) and zero OI when market is closed.
 // Slim a per-expiry Yahoo options response to a flat, compact structure.
@@ -416,6 +440,28 @@ async function loadOptionsForTicker(){
     }
     const snap=S.get('snap_'+t);
     if(snap?.earningsDate){const today=new Date(),earningsD=new Date(snap.earningsDate);const warns=monthly.filter(e=>{const ed=new Date(e);return today<earningsD&&earningsD<=ed;});const timing=snap.earningsHour==='bmo'?' (before open)':snap.earningsHour==='amc'?' (after close)':'';const warnEl=document.getElementById('options-earnings-warn');warnEl.innerHTML=warns.length?`<div class="earnings-warn">Earnings on ${snap.earningsDate}${timing} falls within ${warns.join(', ')} window. Elevated assignment risk.</div>`:'';}
+    // FOMC warning -- separate from and styled distinctly (purple) from the
+    // amber earnings warning above, since they're different kinds of risk.
+    // Only meetings with an expected (more-likely-than-not) hike or cut are
+    // considered -- see _getQualifyingFomcMeetings. Handles multiple
+    // qualifying meetings spanning different expiries by listing each one
+    // against whichever window(s) it falls within, rather than assuming
+    // there's ever just one.
+    {
+      const fomcMeetings=_getQualifyingFomcMeetings();
+      const fomcWarnEl=document.getElementById('options-fomc-warn');
+      if(fomcWarnEl){
+        const today2=new Date();
+        const fomcParts=fomcMeetings.map(fm=>{
+          const fmD=new Date(fm.meetingDate+'T12:00:00Z');
+          const windowsHit=monthly.filter(e=>{const ed=new Date(e);return today2<fmD&&fmD<=ed;});
+          if(!windowsHit.length)return null;
+          const dateLabel=fmD.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+          return dateLabel+' ('+fm.direction+' '+fm.pct+'% expected) falls within '+windowsHit.join(', ')+' window';
+        }).filter(Boolean);
+        fomcWarnEl.innerHTML=fomcParts.length?`<div class="fomc-warn">&#x1F3DB; FOMC: ${fomcParts.join('. ')}. Elevated volatility risk around the rate decision.</div>`:'';
+      }
+    }
     lastOptionsTickerLoaded=t;
     // Auto-render the table now that data, chips, and prefs are all ready.
     // Without this, a fresh fetch after tab navigation is never reflected until
@@ -451,19 +497,45 @@ function buildOptionsTable(){
   let tableBodyHTML='';
   // today is already declared above in buildOptionsTable scope
 
-  // Earnings info for banner
+  // Earnings + FOMC banners, unified into one date-sorted list rather than
+  // two separate insertion systems. Previously earnings had a "before this
+  // group's header" placement (fires when earningsD<expD) while FOMC only
+  // ever inserted after the header, unconditionally -- meaning if both an
+  // earnings date and an earlier FOMC meeting fell in the same expiry
+  // group, the FOMC banner (chronologically first) would render below the
+  // earnings banner (chronologically later), which is backwards. Merging
+  // both into one sorted list and inserting each group's qualifying,
+  // not-yet-shown events together, in date order, fixes that regardless of
+  // how many of either type land in the same window.
   const snap_for_opts=S.get('snap_'+t);
   const earningsDateStr=snap_for_opts?.earningsDate||null;
   const earningsHourStr=snap_for_opts?.earningsHour||null;
   const earningsTiming=earningsHourStr==='bmo'?' BMO':earningsHourStr==='amc'?' AMC':'';
   const earningsD=earningsDateStr?new Date(earningsDateStr+'T12:00:00Z'):null;
-  let earningsBannerInserted=false;
 
-  function earningsBanner(){
-    if(!earningsDateStr||earningsBannerInserted)return'';
-    earningsBannerInserted=true;
-    const daysAway=daysUntilDate(earningsDateStr)??Math.round((earningsD-today)/86400000);
-    return `<tr><td colspan="7" style="padding:0;border:none"><div style="background:rgba(255,165,2,0.1);border-left:3px solid rgba(255,165,2,0.7);padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--warn);font-weight:600">&#x1F4C5; Earnings ${earningsDateStr}${earningsTiming} &middot; ${daysAway}d away</div></td></tr>`;
+  const bannerEvents=[];
+  if(earningsD){
+    bannerEvents.push({date:earningsD,shown:false,render:()=>{
+      const daysAway=daysUntilDate(earningsDateStr)??Math.round((earningsD-today)/86400000);
+      return `<tr><td colspan="7" style="padding:0;border:none"><div style="background:rgba(255,165,2,0.1);border-left:3px solid rgba(255,165,2,0.7);padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--warn);font-weight:600">&#x1F4C5; Earnings ${earningsDateStr}${earningsTiming} &middot; ${daysAway}d away</div></td></tr>`;
+    }});
+  }
+  _getQualifyingFomcMeetings().forEach(fm=>{
+    const fmD=new Date(fm.meetingDate+'T12:00:00Z');
+    bannerEvents.push({date:fmD,shown:false,render:()=>{
+      const dateLabel=fmD.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+      const daysAway=daysUntilDate(fm.meetingDate)??Math.round((fmD-today)/86400000);
+      return `<tr><td colspan="7" style="padding:0;border:none"><div style="background:rgba(124,106,247,0.1);border-left:3px solid rgba(124,106,247,0.7);padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--accent3);font-weight:600">&#x1F3DB; FOMC ${dateLabel} (${fm.direction} ${fm.pct}% expected) &middot; ${daysAway}d away</div></td></tr>`;
+    }});
+  });
+  bannerEvents.sort((a,b)=>a.date-b.date);
+
+  // Every qualifying, not-yet-shown event up to and including this expiry,
+  // in date order -- a group can pick up more than one of either type.
+  function bannersUpTo(expD){
+    return bannerEvents.filter(ev=>!ev.shown&&ev.date<=expD)
+      .map(ev=>{ev.shown=true;return ev.render();})
+      .join('');
   }
 
   const priceSepRow=`<tr><td colspan="7" style="padding:0;border:none">
@@ -492,11 +564,9 @@ function buildOptionsTable(){
     // Format expiration date for display
     const expLabel=expD.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'});
 
-    // Insert earnings banner BEFORE this expiration header if earnings falls before this expiry
-    // and has not been inserted yet
-    if(earningsD&&!earningsBannerInserted&&earningsD<expD){
-      tableBodyHTML+=earningsBanner();
-    }
+    // Insert any qualifying, not-yet-shown banner events (earnings and/or
+    // FOMC) before this expiration's header, in date order.
+    tableBodyHTML+=bannersUpTo(expD);
 
     // Expiration group header row -- pre-compute RGB to avoid regex inside template literal
     const hx=expColor.replace('#','');
@@ -504,13 +574,6 @@ function buildOptionsTable(){
     const eg=parseInt(hx.substring(2,4),16);
     const eb=parseInt(hx.substring(4,6),16);
     tableBodyHTML+='<tr><td colspan="7" style="padding:0;border:none"><div style="background:rgba('+er+','+eg+','+eb+',0.12);border-left:4px solid '+expColor+';border-top:1px solid '+expColor+'44;padding:6px 10px;font-family:var(--mono);font-size:11px;color:'+expColor+';font-weight:600;display:flex;justify-content:space-between;align-items:center"><span>'+expLabel+'</span><span style="font-size:13px;letter-spacing:0.5px">DTE: '+dte+'</span></div></td></tr>';
-
-    // Insert earnings banner INSIDE this group if earnings falls within this expiry window
-    // (after prev expiry and before this expiry -- already checked above for between-group case)
-    // Here check if earnings is AFTER prev expiry but this is first group (no prev expiry)
-    if(earningsD&&!earningsBannerInserted&&earningsD<=expD){
-      tableBodyHTML+=earningsBanner();
-    }
 
     // Current price separator
     const sepIdx=expRows.findIndex(r=>r.strike>currentPrice);
@@ -528,8 +591,12 @@ function buildOptionsTable(){
     }
   });
 
-  // Earnings banner after all expirations if not yet inserted
-  if(earningsD&&!earningsBannerInserted){tableBodyHTML+=earningsBanner();}
+  // Catch-all: any banner event that never fell within a displayed
+  // expiry's window (e.g. an earnings date or FOMC meeting after every
+  // shown expiration) still gets shown, appended at the end, rather than
+  // silently disappearing. Covers both types now, not just earnings.
+  const _unshownBanners=bannerEvents.filter(ev=>!ev.shown).map(ev=>{ev.shown=true;return ev.render();}).join('');
+  if(_unshownBanners)tableBodyHTML+=_unshownBanners;
   // Timestamp reflects the oldest per-expiry cache among selected expirations,
   // since that's the actual data source for the table rows.
   // No live/cached binary -- just "data as of [time]" which is what matters.

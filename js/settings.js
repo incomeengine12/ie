@@ -116,10 +116,18 @@ async function checkFlightModeReady(){
     status:snapStatus,
     detail:snapMissing>0?snapMissing+' tickers missing':snapStale>0?snapStale+' tickers stale':'All fresh'});
 
-  // 2. Price history
+  // 2. Price history -- checks hist2y_ specifically, the app's actual
+  // single source of truth for price history everywhere else (HVR,
+  // relative performance, Bollinger Bands, Multiple History). Previously
+  // checked a 'hist_'+ticker key that is never written by any code path
+  // in the current architecture (hist6mo is always a derived, in-memory
+  // slice of hist2y_, never its own persisted cache) -- meaning this
+  // check silently reported every ticker as missing, always, regardless
+  // of actual state, since it was auditing a key that structurally can't
+  // exist. Real, if quiet, bug: a Flight Mode check that could never pass.
   let histMissing=0;
-  wl.forEach(t=>{if(!S.get('hist_'+t))histMissing++;});
-  checks.push({label:'Price history (6M)',status:histMissing>0?'red':'green',
+  wl.forEach(t=>{if(!S.get('hist2y_'+t))histMissing++;});
+  checks.push({label:'Price history (2Y)',status:histMissing>0?'red':'green',
     detail:histMissing>0?histMissing+' missing':'All cached'});
 
   // 3. Options chains
@@ -429,6 +437,7 @@ function resetFomcDatesToDefault(){
 }
 
 function openSettings(){
+  _checkForAppUpdate();
   document.getElementById('finnhub-key-input').value=FINNHUB_KEY;
   document.getElementById('worker-fragment-settings-input').value=S.get('worker_fragment')||'';
   document.getElementById('default-watchlist-input').value=watchlist.join(',');
@@ -519,7 +528,7 @@ function clearMarketDataCache(){
   const PRESERVE=new Set([
     'watchlist','tz_pref','font_size','vix_threshold','offline_mode',
     'watchlist_sort','heatmap_mode','watchlist_filter_mode','watchlist_starred','put_pos_sort','cc_pos_sort',
-    'options_cutoff_et','rp_earnings_toggle','rp_span','bb_span','earnings_view_mode','dashboard_view_mode',
+    'options_cutoff_et','rp_earnings_toggle','earnings_view_mode','dashboard_view_mode',
     'vol_badge_state','conviction_weights','last_ticker',
     'income_accounts_meta','income_active_account','income_migration_v1',
     'debug_options_fetch','prefetch_sleep_ms','fetch_upgrades_enabled',
@@ -539,11 +548,22 @@ function clearMarketDataCache(){
     if(k.startsWith('put_pos'))continue;
     if(k.startsWith('cc_pos'))continue;
     if(k.startsWith('vol_badge'))continue;
+    // NOTE: multiple_hist_ and fwdpe_track_ are intentionally NOT swept here,
+    // even though this block clears several other per-ticker caches -- they
+    // aren't re-fetchable market-data caches, they're accumulated history
+    // (see _buildExportData below). Don't widen the prefixes above to catch
+    // them; a "hist" or "mult" match here would silently destroy data a
+    // refresh can't restore. fed_futures used to be swept here too, but is
+    // no longer treated as purely routine -- it can genuinely fail to
+    // re-fetch cleanly (an expired CME contract not returning usable data),
+    // which is exactly why it now has its own carry-forward preservation
+    // and export support. Sweeping it here on every "routine" clear would
+    // undo that protection for no reason.
     if(k.startsWith('snap_')||k.startsWith('hist_')||k.startsWith('hist1y_')||
        k.startsWith('hist2y_')||k.startsWith('options_')||k.startsWith('news_')||
        k.startsWith('rec_')||k.startsWith('upgrades_')||
        k.startsWith('mkt_')||k.startsWith('tbills_')||k.startsWith('vix')||
-       k.startsWith('div_')||k==='market_news'||k==='fed_futures'||
+       k.startsWith('div_')||k==='market_news'||
        k==='hist2y_sp500'){
       toDelete.push(k);
     }
@@ -565,6 +585,30 @@ const EXPORT_KEYS_STATIC=[
   'dashboard_notes','bb_gap_overlay','gap_list_filter',
   'tax_state','state_tax_rate',
   'fomc_meeting_dates_override',
+  // Self-healing baseline for the meeting-probability calculation -- now a
+  // full history of every meeting ever successfully resolved, indexed by
+  // meeting date (replaces the old single-latest-value version, which had
+  // a real blind spot: it could only help a stuck meeting whose immediate
+  // predecessor happened to be the single most recent resolution overall,
+  // not any earlier one). Not re-derivable from a fresh fetch if lost --
+  // losing it just means falling back to the honest "insufficient
+  // baseline" placeholder for whatever specific meetings it would have
+  // covered, rather than a correctness problem, but worth preserving the
+  // continuity. Deliberately unbounded (no 2-year-style cap) -- the
+  // storage cost for keeping this indefinitely is a few KB even over
+  // decades, and unlike price history, there's no external data-provider
+  // ceiling forcing a cutoff here.
+  'fomc_meeting_history',
+  // The raw Fed Funds Futures contract data itself (not just the derived
+  // self-healing rate above) -- exportable specifically so a successful
+  // fetch on one device/instance can be transplanted into another that's
+  // stuck on a failed fetch for the same month, via a trimmed-down import
+  // containing just this one key. Previously only treated as a routine,
+  // re-fetchable market-data cache (eligible for the Clear Market Data
+  // Cache sweep), which is still correct for ROUTINE refreshes -- this
+  // addition is specifically about enabling manual cross-instance repair
+  // when a fetch has been failing consistently, not about the normal case.
+  'fed_futures',
 ];
 
 function _buildExportData(){
@@ -582,6 +626,25 @@ function _buildExportData(){
       const v=S.get(_k);
       if(v!=null&&(!Array.isArray(v)||v.length>0))data.keys[_k]=v;
     }
+    // Multiple History (TTM & forward P/E): both the permanent per-quarter
+    // records and the in-flight dense tracking data. Neither is re-fetchable
+    // from Yahoo -- there's no historical forward-estimate endpoint -- so
+    // unlike snap_/hist2y_/options_ (deliberately excluded, since a refresh
+    // trivially repopulates them), losing either of these without a recent
+    // backup is a permanent gap, same reasoning as earnings_hist_ above.
+    if(_k.startsWith('multiple_hist_')||_k.startsWith('fwdpe_track_')){
+      const v=S.get(_k);
+      if(v!=null&&(!Array.isArray(v)||v.length>0))data.keys[_k]=v;
+    }
+    // Next-FY Multiple & Price Target: same reasoning as Multiple History
+    // above -- Yahoo has no historical forward-estimate endpoint, so
+    // nextfy_hist_ (permanent, one full series per completed fiscal year)
+    // and nextfy_track_ (the in-flight current-year series) are both
+    // genuinely irreplaceable if lost.
+    if(_k.startsWith('nextfy_hist_')||_k.startsWith('nextfy_track_')){
+      const v=S.get(_k);
+      if(v!=null&&(!Array.isArray(v)||v.length>0))data.keys[_k]=v;
+    }
     // All per-account income keys: income_ACCTID_*
     if(_k.startsWith('income_acct_')){
       const v=S.get(_k);
@@ -594,6 +657,14 @@ function _buildExportData(){
     }
     // Per-ticker watchlist notes
     if(_k.startsWith('watchlist_note_')){
+      const v=S.get(_k);
+      if(v)data.keys[_k]=v;
+    }
+    // Per-ticker Relative Performance comparison selections -- a genuine
+    // user choice (which ticker to benchmark against), not re-derivable
+    // from any fetch. Found missing during a full audit -- same category
+    // as watchlist_note_ just above, just never added.
+    if(_k.startsWith('rp_compare_')){
       const v=S.get(_k);
       if(v)data.keys[_k]=v;
     }
@@ -923,11 +994,18 @@ function _updateRefreshHealthBadge(){
   if(!h){badge.style.display='none';return;}
   const total=h.summary?.total||0;
   const ok=h.summary?.ok||0;
+  const degraded=h.summary?.degraded?.length||0;
   const allOk=ok===total;
   badge.style.display='flex';
   badge.style.background=allOk?'rgba(0,212,170,0.15)':'rgba(255,165,2,0.2)';
   badge.style.borderColor=allOk?'rgba(0,212,170,0.4)':'rgba(255,165,2,0.5)';
-  badge.innerHTML=(allOk?'&#x2714;':'&#x26A0;')+' '+ok+'/'+total+' tickers'+(allOk?'':' <span style="font-size:9px">tap for details</span>');
+  // Degraded tickers (snap/hist/finnhub all succeeded, but quoteSummary --
+  // sector/beta/PEG/price targets/etc. -- came back from a previous fetch,
+  // not this one) get a de-emphasized note rather than changing the
+  // badge's overall pass/fail color, since a stale PEG value is a much
+  // smaller concern than a genuinely failed ticker.
+  const degradedNote=degraded>0?' <span style="color:var(--text3)">&middot; '+degraded+' stale valuation</span>':'';
+  badge.innerHTML=(allOk?'&#x2714;':'&#x26A0;')+' '+ok+'/'+total+' tickers'+degradedNote+((!allOk||degraded>0)?' <span style="font-size:9px">tap for details</span>':'');
 }
 
 function openRefreshHealthModal(){
@@ -941,25 +1019,50 @@ function openRefreshHealthModal(){
   }
   const total=h.summary?.total||0;const ok=h.summary?.ok||0;
   const failed=h.summary?.failed||[];
+  const degraded=h.summary?.degraded||[];
   const allOk=ok===total;
   const elapsed=h.elapsedLabel||null;
 
+  // Timing instrumentation -- temporary, added to answer a specific
+  // question (is news on Finnhub's slow tier like earnings/upgrades, or
+  // its fast tier?) before deciding whether to throttle it too. Shown
+  // only when present, so this doesn't clutter the modal once removed.
+  const ts=h.timingSummary;
+  const _fmtTiming=(label,stat)=>stat?'<div style="display:flex;justify-content:space-between"><span style="color:var(--text2)">'+label+'</span><span style="color:var(--text3)">avg '+stat.avg+'ms &middot; '+stat.min+'-'+stat.max+'ms &middot; n='+stat.n+'</span></div>':'';
+  const timingHtml=ts&&(ts.earnings||ts.upgrades||ts.news||ts.yahooBatch||ts.expiryChains)
+    ?'<div style="font-family:var(--mono);font-size:10px;background:var(--surface2);border-radius:6px;padding:8px;margin-bottom:10px">'
+     +'<div style="color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;font-size:9px;margin-bottom:4px">Endpoint timing (this run)</div>'
+     +_fmtTiming('Finnhub earnings',ts.earnings)
+     +_fmtTiming('Finnhub upgrades',ts.upgrades)
+     +_fmtTiming('Finnhub news',ts.news)
+     +_fmtTiming('Yahoo batch (whole)',ts.yahooBatch)
+     +_fmtTiming('Yahoo expiry chains',ts.expiryChains)
+     +'</div>'
+    :'';
+
   const tickerRows=Object.entries(h.tickers||{}).map(([t,v])=>{
-    const ok=v.snap&&v.hist&&v.finnhub;
-    const status=ok?'&#x2714;':'&#x26A0;';
-    const color=ok?'var(--green)':'var(--warn)';
+    const coreOk=v.snap&&v.hist&&v.finnhub;
+    const isDegraded=coreOk&&v.summaryDegraded;
+    // Three states, not two: fully OK, degraded (core data fine, but
+    // sector/beta/PEG/price targets/etc. are carried over from an earlier
+    // fetch rather than confirmed fresh this run), or failed (core data
+    // itself didn't come through). Distinct color/icon per state so a
+    // stale-valuation ticker doesn't read as seriously as a genuine failure.
+    const status=coreOk?(isDegraded?'&#x25D1;':'&#x2714;'):'&#x26A0;';
+    const color=coreOk?(isDegraded?'#64b5f6':'var(--green)'):'var(--warn)';
     const detail=[
       v.snap?'':'snap failed',
       v.hist?'':'hist failed',
       v.options===true?'':v.options==='skipped'?'options skipped (fresh)':'options failed',
       v.finnhub?'':(v.finnhubDetail?v.finnhubDetail:'finnhub failed'),
+      isDegraded?'valuation data (sector/beta/PEG/price targets) is from an earlier fetch, not this one':'',
     ].filter(Boolean).join(', ');
     return `<div onclick="_goToTickerFromHealthModal('${t}')" style="font-family:var(--mono);font-size:10px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.04);cursor:pointer">
       <div style="display:flex;justify-content:space-between">
         <span style="color:var(--text2)">${t} <span style="color:var(--text3);font-size:9px">&#x203A;</span></span>
-        <span style="color:${color}">${status}${ok?' OK':''}</span>
+        <span style="color:${color}">${status}${coreOk?(isDegraded?' Stale valuation':' OK'):''}</span>
       </div>
-      ${ok?'':`<div style="color:${color};margin-top:2px;word-break:break-word">${detail}</div>`}
+      ${coreOk&&!isDegraded?'':`<div style="color:${color};margin-top:2px;word-break:break-word">${detail}</div>`}
     </div>`;
   }).join('');
 
@@ -967,8 +1070,9 @@ function openRefreshHealthModal(){
     <div class="modal-title">Last Refresh Health</div>
     <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px">
       Completed: ${h.completedTs||h.ts||'unknown'}${elapsed?' &nbsp;·&nbsp; <span style="color:var(--text2)">'+elapsed+'</span>':''}<br>
-      Result: <span style="color:${allOk?'var(--green)':'var(--warn)'}">${ok}/${total} tickers fully refreshed</span>
+      Result: <span style="color:${allOk?'var(--green)':'var(--warn)'}">${ok}/${total} tickers fully refreshed</span>${degraded.length?'<br>Valuation data (sector/beta/PEG/price targets) stale on <span style="color:#64b5f6">'+degraded.length+' ticker'+(degraded.length===1?'':'s')+'</span> -- quoteSummary failed as a whole for those, so nothing on this run was mixed fresh/stale within a single ticker.':''}
     </div>
+    ${timingHtml}
     ${allOk?'':`<button class="btn btn-secondary" id="retry-failed-btn" style="width:100%;margin-bottom:10px" onclick="retryFailedTickers()">&#x21BB; Retry ${failed.length} Failed</button>`}
     <div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-bottom:4px">Tap any row to jump to that ticker</div>
     <div style="margin-bottom:12px">${tickerRows}</div>
@@ -1016,9 +1120,56 @@ async function retryFailedTickers(){
   toast('Retry complete');
 }
 
+// Reports the latest deployed build available on GitHub, by fetching
+// sw.js directly (cache-busted, so this isn't fooled by a stale cached
+// copy of the very file it's inspecting).
+//
+// Deliberately does NOT claim to know which build is currently running,
+// even though that seems like the obvious next step -- it isn't reliably
+// knowable client-side. The original version compared this against
+// caches.keys(), but Cache Storage answers "what caches exist," not
+// "what's actively controlling this page right now": a service worker
+// can silently install a newer cache in the background, well before that
+// new version actually takes over -- so a page still genuinely running
+// build 433 could see a 434 cache already sitting there and misreport
+// itself as current. That's a real, observed bug, not a hypothetical --
+// caught directly from a screenshot showing "latest version -- build 434"
+// while the header (a separate, simpler label) still correctly showed
+// 433. The only fully reliable fix is asking the actual controlling
+// service worker directly via postMessage, which sw.js doesn't support
+// yet -- deliberately not building that now. This simpler version reports
+// only what's genuinely knowable (what's latest available) and stays
+// silent on what's currently running, rather than risk repeating the
+// same false claim in a different form.
+async function _checkForAppUpdate(){
+  const statusEl=document.getElementById('app-update-status');
+  if(!statusEl)return;
+  statusEl.textContent='Checking for updates...';
+  try{
+    const resp=await fetch('./sw.js?_t='+Date.now(),{cache:'no-store'});
+    const text=await resp.text();
+    const m=text.match(/const APP_BUILD\s*=\s*(\d+)/);
+    const remoteBuild=m?parseInt(m[1]):null;
+    if(remoteBuild==null){
+      statusEl.textContent='Could not check for updates right now';
+      return;
+    }
+    statusEl.textContent='Latest available: build '+remoteBuild+'. If this differs from the header above, tap Force App Refresh below.';
+  }catch(e){
+    statusEl.textContent='Could not check for updates -- '+(e?.message||'network error');
+  }
+}
+
 function forceAppRefresh(){
   // reload() without true so the SW intercepts the reload and serves
   // files from its fresh cache. reload(true) bypasses the SW on iOS Safari.
-  if('caches'in window){caches.keys().then(keys=>{Promise.all(keys.map(k=>caches.delete(k))).then(()=>{toast('Cache cleared -- reloading...',2500);setTimeout(()=>window.location.reload(),2500);});});}
+  // Preserves the vendor cache (Chart.js, fonts) deliberately -- that's
+  // the entire point of splitting it out (see sw.js): a routine refresh
+  // shouldn't re-download files that never changed. Matched by prefix
+  // rather than an exact name, since this file can't see sw.js's own
+  // VENDOR_CACHE_NAME constant directly (different execution context) --
+  // same naming-convention approach already used elsewhere (e.g. the
+  // header's build-label parsing).
+  if('caches'in window){caches.keys().then(keys=>{Promise.all(keys.filter(k=>!k.startsWith('income-engine-vendor-')).map(k=>caches.delete(k))).then(()=>{toast('Cache cleared -- reloading...',2500);setTimeout(()=>window.location.reload(),2500);});});}
   else{window.location.reload();}
 }

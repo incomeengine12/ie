@@ -86,6 +86,7 @@
       <button class="btn btn-secondary" id="dash-view-gap" onclick="setDashboardViewMode('gap')" style="font-size:10px;padding:3px 8px;opacity:0.4">Gap Fill</button>
       <button class="btn btn-secondary" id="dash-view-notes" onclick="setDashboardViewMode('notes')" style="font-size:10px;padding:3px 8px;opacity:0.4">Notes</button>
       <button class="btn btn-secondary" id="dash-view-wheelbt" onclick="setDashboardViewMode('wheelbt')" style="font-size:10px;padding:3px 8px;opacity:0.4">Wheel Backtest</button>
+      <button class="btn btn-secondary" id="dash-view-valuation" onclick="setDashboardViewMode('valuation')" style="font-size:10px;padding:3px 8px;opacity:0.4">Valuation</button>
     </div>
   </div>
   <div id="dash-conviction-controls" class="card">
@@ -198,6 +199,22 @@
     </div>
     <div id="wheelbt-ranking-content"><div class="empty"><div class="empty-icon">&#x1F4CA;</div>Loading...</div></div>
   </div>
+  <div id="dash-valuation-card" class="card" style="display:none">
+    <div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Valuation by Sector</div>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px">Your watchlist grouped by sector, ranked by valuation multiple within each group -- a low P/E or PEG only means much relative to similar companies, not across unrelated sectors. ETFs, funds, and anything not yet prefetched land in "No sector data" below. PEG here uses forward P/E internally (Yahoo's methodology) -- see the paired value in each row.</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+      <div style="display:flex;gap:4px">
+        <span id="valuation-scope-all" onclick="setValuationScope('all')" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:var(--accent);color:#000">All</span>
+        <span id="valuation-scope-starred" onclick="setValuationScope('starred')" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:var(--surface3);color:var(--text3)">Starred Only</span>
+      </div>
+      <div style="display:flex;gap:4px">
+        <span id="valuation-metric-pe" onclick="setValuationMetric('pe')" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:var(--accent);color:#000">P/E TTM</span>
+        <span id="valuation-metric-pe_fwd" onclick="setValuationMetric('pe_fwd')" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:var(--surface3);color:var(--text3)">P/E Fwd</span>
+        <span id="valuation-metric-peg" onclick="setValuationMetric('peg')" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;background:var(--surface3);color:var(--text3)">PEG</span>
+      </div>
+    </div>
+    <div id="valuation-content"><div class="empty"><div class="empty-icon">&#x1F4CA;</div>Loading...</div></div>
+  </div>
 </div>
 
 
@@ -259,6 +276,7 @@
     </div>
   </div>
   <div id="options-earnings-warn"></div>
+  <div id="options-fomc-warn"></div>
   <div id="options-content"></div>
   <div id="oi-chart-section" style="display:none">
     <div class="card">
@@ -463,7 +481,27 @@
   </div>
 </div>
 
-<!-- ── SECTION: Conviction Scoring ─────────────────────────────────── -->
+<!-- ── SECTION: Multiple History & Forward Estimates ───────────────── -->
+<div class="card" style="margin-bottom:8px">
+  <div class="gs-header" onclick="toggleGuide('multhist')">
+    <div class="card-title" style="margin:0"><span class="dot" style="background:var(--accent)"></span>Multiple History &amp; Forward Estimates</div>
+    <span class="gs-chevron" id="gc-multhist">&#9658;</span>
+  </div>
+  <div class="gs-body" id="gb-multhist">
+    <div class="guide-h3">Why Two Cards</div>
+    <div class="guide-kv"><span class="guide-key">Two different bases</span><span class="guide-val">Multiple History uses a TTM-composite basis -- the three most recently reported quarters plus the current quarter's estimate, summed into a trailing-twelve-month EPS figure. Next-FY uses a completely different basis -- price divided by next fiscal year's consensus EPS estimate, the standard "next year's multiple" figure most mainstream analyst coverage actually means. These are genuinely different metrics on the same day for the same stock, not two views of one number -- deliberately kept as two separate cards rather than merged into one, since blending them mid-chart would produce a number that isn't really either metric, just an artifact of switching formulas partway through.</span></div>
+    <div class="guide-h3">Multiple History (TTM &amp; Forward P/E)</div>
+    <div class="guide-kv"><span class="guide-key">What it shows</span><span class="guide-val">One continuous line: solid where the multiple is realized or currently tracked, dashed past the "now" marker where it's a slider-driven projection to the next earnings report. Past quarters are archived permanently once a new one begins tracking; a quarter still in progress updates continuously as its underlying EPS estimate gets revised.</span></div>
+    <div class="guide-kv"><span class="guide-key">The slider</span><span class="guide-val">Drag to see the price at a different multiple, holding the current quarter's EPS estimate fixed -- a quick way to explore "what if the market re-rates this to roughly what it's traded at recently." The right-edge date marker shows exactly what calendar date the projection reaches (typically the next earnings report), also stated in the what-if label itself.</span></div>
+    <div class="guide-kv"><span class="guide-key">Requires</span><span class="guide-val">Builds from today forward -- Yahoo has no historical forward-estimate endpoint, so past quarters can't be backfilled the way price history can. Expect a "Building history" message on a ticker you've only just started tracking; it fills in over the following quarters.</span></div>
+    <div class="guide-h3">Next-FY Multiple &amp; Price Target</div>
+    <div class="guide-kv"><span class="guide-key">What it shows</span><span class="guide-val">The same solid/dashed convention as Multiple History, but on the next-fiscal-year basis, projecting to fiscal year-end rather than the next earnings report. Rolls to a new fiscal year automatically once the current one's "+1y" target advances, archiving the prior year's full tracked series permanently -- not just its first and last points, since a full year's real revisions are sparse enough that keeping everything costs almost nothing.</span></div>
+    <div class="guide-kv"><span class="guide-key">The slider</span><span class="guide-val">Same mechanic as Multiple History's, holding next-FY EPS fixed while exploring a different multiple -- but the target here lands at fiscal year-end, matching the horizon analysts actually mean by "next year's multiple," so the slider's default position is exactly today's real figure, not something requiring mental math to translate.</span></div>
+    <div class="guide-kv"><span class="guide-key">Requires</span><span class="guide-val">Same backfill limitation as Multiple History -- builds from today forward. Unlike quarterly tracking, a fiscal year rolls only about once a year, so this card's history accumulates more slowly but each entry stays relevant for much longer.</span></div>
+  </div>
+</div>
+
+
 <div class="card" style="margin-bottom:8px">
   <div class="gs-header" onclick="toggleGuide('conviction')">
     <div class="card-title" style="margin:0"><span class="dot" style="background:#ab47bc"></span>Conviction Scoring</div>
@@ -495,7 +533,7 @@
     <span class="gs-chevron" id="gc-dashanalytics">&#9658;</span>
   </div>
   <div class="gs-body" id="gb-dashanalytics">
-    <div class="commentary" style="margin-bottom:10px">Three additional Dashboard views beyond the Puts/Covered Calls conviction scores. All three are cache-only -- they analyze whatever price/position history is already stored, no new fetches.</div>
+    <div class="commentary" style="margin-bottom:10px">The additional Dashboard views beyond the Puts/Covered Calls conviction scores are all cache-only -- they analyze whatever price/position history is already stored, no new fetches.</div>
     <div class="guide-h3">RSI Backtest</div>
     <div class="guide-kv"><span class="guide-key">What it answers</span><span class="guide-val">Has RSI oversold/overbought actually preceded a real price move, for the specific stocks you watch -- backtested against your own cached 2-year history, not a textbook assumption.</span></div>
     <div class="guide-kv"><span class="guide-key">Entering vs. leaving</span><span class="guide-val">Tracked separately, and they answer different questions. RSI can stay under 30 for weeks during an ongoing decline -- entering oversold doesn't mean the move is over. Leaving measures what happens once the stretched condition actually resolves.</span></div>
@@ -529,6 +567,12 @@
     <div class="guide-kv"><span class="guide-key">Full History toggle</span><span class="guide-val">Switches the example run from "Most Recent" (~1 year) to one continuous run across the ticker's entire cached history. Shows both the raw total (unannualized, since it spans more than a year) and that same total's annualized equivalent side by side.</span></div>
     <div class="guide-kv"><span class="guide-key">Premium source</span><span class="guide-val">Black-Scholes pricing with realized volatility standing in for implied volatility -- real historical options-chain data isn't available without a paid feed. This is a documented approximation, always labeled as such in the results, and likely understates real historical premium somewhat (implied vol typically runs above subsequent realized vol) -- a conservative bias, not an inflated one.</span></div>
     <div class="guide-kv"><span class="guide-key">Not modeled</span><span class="guide-val">Bid-ask spread, volatility skew beyond the term-structure estimate, and dividend-driven early assignment are all out of scope for this version -- treat results as directional, not a precise forecast.</span></div>
+    <div class="guide-h3">Valuation by Sector</div>
+    <div class="guide-kv"><span class="guide-key">What it shows</span><span class="guide-val">Your watchlist grouped by sector (Technology, Financial Services, Energy, etc.), tickers within each sector ranked by whichever valuation multiple you pick. A low P/E or PEG only means much relative to similar companies -- comparing across unrelated sectors makes almost anything outside high-growth tech look "cheap" without that actually meaning anything. Sector/industry comes from Yahoo's quoteSummary, same batched call already used for P/E and beta -- no separate fetch.</span></div>
+    <div class="guide-kv"><span class="guide-key">Three metrics</span><span class="guide-val">P/E (TTM): price over the last 12 months of actual, already-reported earnings -- backward-looking, no forecast involved. P/E (Forward): price over the next 12 months of analyst-estimated earnings -- forward-looking, and only as good as the estimate. PEG: P/E divided by expected earnings growth, meant to normalize P/E for how fast a company is growing. Yahoo's PEG specifically uses forward P/E (not trailing) as its own numerator, divided by a 5-year expected growth rate -- other sites sometimes use trailing P/E instead, which can show a different PEG for the identical stock. That's a genuine methodology difference, not an error, if the numbers don't match somewhere else.</span></div>
+    <div class="guide-kv"><span class="guide-key">Paired value in each row</span><span class="guide-val">Whichever metric you're sorting by is shown large; a second, related metric is shown alongside it -- P/E (TTM) pairs with P/E (Forward) and vice versa, so the gap between them shows the market's implied growth expectation directly. PEG pairs with P/E (Forward) specifically, since that's what it's actually built from internally.</span></div>
+    <div class="guide-kv"><span class="guide-key">Missing data</span><span class="guide-val">A ticker missing the metric you're currently sorting by sinks to the bottom of its own sector rather than mixing in as if it were the cheapest -- a missing value isn't a low value. ETFs, mutual funds, and anything not yet prefetched have no sector at all and land in their own "No sector data" group, always last, rather than disappearing.</span></div>
+    <div class="guide-kv"><span class="guide-key">Scope</span><span class="guide-val">All or Starred Only, same convention as Wheel Backtest's ranking filter. Unlike that filter, your Scope and metric choice here persist across sessions.</span></div>
     <div class="guide-h3">Notes</div>
     <div class="guide-kv"><span class="guide-key">Purpose</span><span class="guide-val">A freeform scratchpad on the Dashboard, separate from per-ticker Watchlist notes -- for anything broader that isn't tied to a single stock. No length limit. Saves automatically a moment after you stop typing.</span></div>
   </div>
@@ -555,6 +599,9 @@
     <div class="guide-h3">IV Crush</div>
     <div class="guide-kv"><span class="guide-key">What it is</span><span class="guide-val">Implied volatility spikes before earnings announcements (uncertainty = demand for options). After earnings, uncertainty resolves and IV collapses — often 30–50% overnight.</span></div>
     <div class="guide-kv"><span class="guide-key">For sellers</span><span class="guide-val">Selling puts before earnings captures elevated premium but risks large gap moves. Selling the day after earnings captures lower but "clean" premium without binary event risk.</span></div>
+    <div class="guide-h3">Risk Warnings</div>
+    <div class="guide-kv"><span class="guide-key">Earnings banner (amber)</span><span class="guide-val">Appears both as a summary at the top of the Options tab and inline within the table, whenever the ticker's earnings date falls within one of the displayed expirations. IV crush and gap risk both concentrate around that date -- elevated assignment risk either way.</span></div>
+    <div class="guide-kv"><span class="guide-key">FOMC banner (purple)</span><span class="guide-val">Same idea, for FOMC meetings where the Market tab's own meeting-odds calculation shows a hike or cut as more likely than a hold. Hold-expected meetings are deliberately never flagged -- only genuine, meaningfully-probable rate moves. Reads the Market tab's own cached data, so visiting Market at least once populates it; nothing shows until then. A chain spanning more than one qualifying meeting shows all of them, and if both an earnings date and an FOMC meeting land in the same window, they're merged and ordered correctly by date, not just by type.</span></div>
   </div>
 </div>
 
@@ -577,6 +624,7 @@
     <div class="guide-kv"><span class="guide-key">How it works</span><span class="guide-val">The app automatically accumulates confirmed earnings dates as you use it. Each time a future earnings date passes, it&apos;s promoted to the confirmed history cache and used to improve future date estimates.</span></div>
     <div class="guide-kv"><span class="guide-key">Override</span><span class="guide-val">Tap any earnings date row to override the estimated date with the actual confirmed date. The modal shows the algorithm estimate, any cached confirmed date (with one-tap Accept), and a manual date picker.</span></div>
     <div class="guide-kv"><span class="guide-key">Sources (priority order)</span><span class="guide-val">1. Your manual override · 2. Auto-confirmed from prior fetch · 3. Gap-confirmed (≥3% price gap near estimate) · 4. Pure cadence estimate (91-day stepback)</span></div>
+    <div class="guide-kv"><span class="guide-key">Adding a missing date</span><span class="guide-val">A "+ Add" prompt appears on the Ticker page's Relative Performance card when there's a suspiciously large gap in tracked earnings history relative to the available price history -- most common for a recently spun-off or newly listed company, where the automatic sources simply don't go back far enough. Manually-added dates render in teal (matching an override), not gold like an auto-confirmed date, since they represent a direct assertion, not an algorithmic guess. Delete a manually-added date from within its own Override modal -- only manual entries can be deleted, since an auto-fetched one would just reappear on the next refresh.</span></div>
   </div>
 </div>
 
@@ -643,7 +691,7 @@
   </div>
   <div class="gs-body" id="gb-data">
     <div class="guide-h3">Prefetch &amp; Refresh</div>
-    <div class="guide-kv"><span class="guide-key">Prefetch All</span><span class="guide-val">Fetches all data for every watchlist ticker sequentially. Run before making decisions to ensure data is current. The refresh health badge below the button shows how many tickers updated successfully.</span></div>
+    <div class="guide-kv"><span class="guide-key">Prefetch All</span><span class="guide-val">Fetches all data for every watchlist ticker sequentially. Run before making decisions to ensure data is current. The refresh health badge below the button shows how many tickers updated successfully, plus a separate degraded count -- a ticker whose core data (price, history, earnings) came through fine but whose valuation data (sector, beta, PEG, price targets) is carried over from an earlier fetch, distinct from a genuine failure. Tap the badge for a per-ticker breakdown, plus an endpoint timing summary (Finnhub earnings/news, Yahoo's batched quote-and-history fetch, Yahoo's per-expiry options chains) showing where a run's time actually went.</span></div>
     <div class="guide-kv"><span class="guide-key">Force Refresh Everything</span><span class="guide-val">Also refreshes the VIX tab, ETF tab, Market tab, Earnings tab, and runs conviction scoring. Use when you want a complete picture, not just ticker data.</span></div>
     <div class="guide-kv"><span class="guide-key">Refresh Ticker</span><span class="guide-val">Refreshes a single ticker including options chain. Always fetches live — no cache skip. Use when you want the most current data for a specific ticker.</span></div>
     <div class="guide-h3">Options Live Window</div>
@@ -657,9 +705,16 @@
     <div class="guide-h3">Data Sources</div>
     <div class="guide-kv"><span class="guide-key">Finnhub</span><span class="guide-val">Quotes, fundamentals, earnings calendar, analyst recommendations, price targets, news. Free tier: 60 calls/minute.</span></div>
     <div class="guide-kv"><span class="guide-key">Yahoo Finance</span><span class="guide-val">Price history, options chains, VIX, indices, T-bill yields, quoteSummary (PE, EPS, short interest, forward estimates). Accessed via your Cloudflare Worker proxy.</span></div>
+    <div class="guide-h3">Treasury Yields</div>
+    <div class="guide-kv"><span class="guide-key">What it shows</span><span class="guide-val">Three Yahoo Treasury yield indices on the Market tab: ^IRX (3-month T-bill, a genuine short-term rate), ^FVX (5-Year Treasury), and ^TNX (10-Year Treasury). There is no 6-month T-bill index available through Yahoo -- 5-Year and 10-Year are used as the two longer points instead, labeled honestly as what they actually are rather than approximated as "6-month."</span></div>
+    <div class="guide-kv"><span class="guide-key">The three spreads</span><span class="guide-val">3M/5Y and 3M/10Y each read the gap between the short end and one longer point -- 3M/10Y is the standard, widely-tracked recession-watch spread (the same one behind the NY Fed's own published recession-probability model); 3M/5Y is a shorter-horizon version, blending near-term Fed expectations with a medium-term view. 5Y/10Y reads the long end of the curve alone, decoupled from near-term Fed policy entirely. An inverted spread (short rate above the longer one) means the market expects rate cuts ahead; the size of the inversion, not just its presence, is what shifts as expectations change.</span></div>
+    <div class="guide-kv"><span class="guide-key">Chart range toggle</span><span class="guide-val">3M / 6M / 1Y buttons above the chart re-slice the same already-fetched year of daily data by trading-day count (roughly 63 / 126 / 252 days) -- no extra fetch, just a different window into data that's already there.</span></div>
     <div class="guide-h3">Fed Funds Futures &amp; Meeting Odds</div>
     <div class="guide-kv"><span class="guide-key">What it is</span><span class="guide-val">The Market tab's Fed Funds Futures card includes a per-meeting probability breakdown (e.g. "Sep 16: 72% hold, 28% cut 25bp") below the raw implied-rate table -- an estimate of what the futures market is pricing in for each upcoming FOMC decision, not just a single implied-rate number.</span></div>
     <div class="guide-kv"><span class="guide-key">How it's calculated</span><span class="guide-val">Each 30-Day Fed Funds futures contract's price implies an average rate for its whole calendar month. Since a meeting doesn't fall on day 1, that average blends the known pre-meeting rate with the unknown post-meeting rate, weighted by days before/after the meeting date. Solving for the post-meeting rate and comparing it to the pre-meeting rate gives a probability split across hold / cut 25bp / hike 25bp. Meetings are solved in chronological order, each using the prior meeting's solved rate as its own starting point -- not treated independently.</span></div>
+    <div class="guide-kv"><span class="guide-key">Bootstrapping a starting rate</span><span class="guide-val">Solving each meeting requires already knowing the rate going into it, so the fetch reaches one month back from today in addition to six months forward -- specifically to supply that starting point on the (unusual, but real) occasions when the current month is itself a meeting month with nothing meeting-free earlier in the window. If that backward month's own contract doesn't return usable data this fetch (common once it's already expired), the most recently saved value for that exact month is shown instead, marked with a small dot and a note reading "Using last known data for: [month]" -- an implied Fed Funds rate only moves at a meeting, so a slightly older cached value is still meaningfully accurate, not a rough guess.</span></div>
+    <div class="guide-kv"><span class="guide-key">Self-healing across meetings</span><span class="guide-val">Every meeting the app successfully resolves is remembered permanently, indexed by its own date -- so a meeting that can't bootstrap a starting rate from the current fetch window can still resolve using its own true predecessor's outcome, however long ago that was solved, rather than only ever being able to use whatever resolved most recently. This can only help once that specific predecessor has been solved at least once since this feature existed; it can't reach back further than that.</span></div>
+    <div class="guide-kv"><span class="guide-key">"Odds unavailable"</span><span class="guide-val">A meeting can still show this if neither the fetch window nor the self-healing history can supply it a starting rate -- most often an unusual year where two consecutive months both have meetings, colliding with a failed backward fetch and no earlier resolution to fall back on. This is an honest gap, not something being papered over, and it resolves on its own once that meeting's date actually passes and becomes a known, real outcome rather than something to estimate.</span></div>
     <div class="guide-kv"><span class="guide-key">Data source &amp; validity</span><span class="guide-val">Built entirely from the same 30-Day Fed Funds futures prices (Yahoo, via your Worker) already used for the implied-rate table above it -- not scraped from CME's own FedWatch tool, which is a paid, licensed product. The day-weighted-average technique is the same standard, publicly documented method CME's own methodology is built on. This is an independent calculation from public data, not a reproduction of CME's proprietary numbers, and may not exactly match CME's own published probabilities.</span></div>
     <div class="guide-kv"><span class="guide-key">Simplification</span><span class="guide-val">Assumes the market prices in at most one 25bp step per meeting -- correct the large majority of the time, since that's how the Fed normally moves. If the market is genuinely pricing real odds of a 50bp move, this shows as a probability capped at 100% in one direction rather than splitting across three outcomes -- a visible sign to treat that specific reading with more skepticism, not a silent wrong answer.</span></div>
     <div class="guide-kv"><span class="guide-key">FOMC meeting dates</span><span class="guide-val">The calculation needs the exact day of each meeting to correctly split "before" vs "after" days within its contract's month -- get the date wrong and the whole split is wrong for that meeting. Dates are maintained in Settings → FOMC Meeting Dates (built in through Jan 2028; the Fed announces each new year's schedule about a year ahead, usually Aug/Sep, at <a href="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">federalreserve.gov</a>). If a meeting's date is missing from the list, that meeting simply doesn't appear in the breakdown -- the raw implied-rate table above keeps working regardless, only the probability split fades out one meeting at a time as dates run out, never showing something wrong.</span></div>
@@ -732,6 +787,12 @@
   <div class="settings-sheet">
     <div class="settings-handle"></div>
     <div class="settings-title">Settings</div>
+    <div class="card-title" style="margin-bottom:6px"><span class="dot" style="background:var(--accent)"></span>App Updates</div>
+    <div id="app-update-status" style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px;line-height:1.6">Checking for updates...</div>
+    <button class="btn btn-secondary" onclick="forceAppRefresh()" style="width:100%">Force App Refresh</button>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:12px;line-height:1.6">Clears page cache, reloads latest version from GitHub. Your data is preserved.</div>
+    <hr class="divider">
+    <div class="card-title" style="margin-bottom:6px"><span class="dot" style="background:var(--text3)"></span>General Settings</div>
     <div class="input-group"><label class="input-label">Finnhub API Key</label><input class="input" type="password" id="finnhub-key-input" placeholder="Paste your Finnhub API key"></div>
     <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:12px;line-height:1.6">Key stored locally on your device only. Get a free key at finnhub.io.</div>
     <div class="input-group"><label class="input-label">Server Address</label><input class="input" type="text" id="worker-fragment-settings-input" placeholder="the address you were given" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
@@ -932,10 +993,6 @@
       <button class="btn btn-secondary" onclick="resetConvictionWeights()" style="flex:1">Reset Defaults</button>
     </div>
     <hr class="divider">
-    <div class="card-title" style="margin-bottom:10px"><span class="dot" style="background:var(--accent)"></span>App Updates</div>
-    <button class="btn btn-secondary" onclick="forceAppRefresh()">Force App Refresh</button>
-    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:12px;line-height:1.6">Clears page cache, reloads latest version from GitHub. Your data is preserved.</div>
-    <hr class="divider">
     <div class="card-title" style="margin-bottom:6px"><span class="dot" style="background:var(--accent)"></span>Last Refresh Status</div>
     <div id="refresh-health-badge-settings" onclick="openRefreshHealthModal()" style="font-family:var(--mono);font-size:10px;color:var(--text2);cursor:pointer;padding:6px 10px;border-radius:6px;border:1px solid var(--border);margin-bottom:4px">Tap to view last refresh health report</div>
     <hr class="divider">
@@ -951,17 +1008,11 @@
       <button class="btn btn-secondary" style="flex:1;font-size:11px" onclick="resetFomcDatesToDefault()">Reset to Defaults</button>
     </div>
     <hr class="divider">
-    <div class="card-title" style="margin-bottom:10px"><span class="dot" style="background:var(--danger)"></span>Danger Zone</div>
-    <button class="btn btn-secondary" onclick="clearMarketDataCache()" style="margin-bottom:8px;width:100%">Clear Market Data Cache</button>
-    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px;line-height:1.5">Clears options chains, price history, and ticker snapshots only. Preserves your watchlist, positions, earnings overrides, income inputs, and all settings.</div>
-    <button class="btn btn-danger" onclick="clearAllDataWithGuard()">Clear All Cached Data</button>
-    <div style="margin-top:12px">
-      <div class="card-title" style="font-size:12px;margin-bottom:6px"><span class="dot" style="background:var(--accent3)"></span>Storage Usage</div>
-      <div id="storage-display" style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.6">Tap Measure to see usage</div>
-      <button class="btn btn-secondary" onclick="measureStorage()" style="margin-top:6px;width:100%">Measure Storage</button>
-      <button class="btn btn-secondary" id="storage-capacity-test-btn" onclick="measureRealStorageCapacity()" style="margin-top:6px;width:100%">Measure Real Storage Limit (optional, ~1 sec)</button>
-      <div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:4px">Writes and deletes temporary throwaway data to find this device's actual localStorage ceiling, since iOS Safari doesn't report it directly. Safe -- never touches your real data. Result is saved on this device only, not included in exports.</div>
-    </div>
+    <div class="card-title" style="font-size:12px;margin-bottom:6px"><span class="dot" style="background:var(--accent3)"></span>Storage Usage</div>
+    <div id="storage-display" style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.6">Tap Measure to see usage</div>
+    <button class="btn btn-secondary" onclick="measureStorage()" style="margin-top:6px;width:100%">Measure Storage</button>
+    <button class="btn btn-secondary" id="storage-capacity-test-btn" onclick="measureRealStorageCapacity()" style="margin-top:8px;width:100%;font-size:10px;padding:6px;opacity:0.75">Recalibrate Real Storage Limit (optional, ~1 sec)</button>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:4px">This runs automatically once per device already -- only needed again if you suspect it's stale (e.g. after an iOS update). Writes and deletes temporary throwaway data to find this device's actual localStorage ceiling, since iOS Safari doesn't report it directly. Safe -- never touches your real data. Result is saved on this device only, not included in exports.</div>
     <div style="margin-top:12px">
       <div class="card-title" style="font-size:12px;margin-bottom:6px"><span class="dot" style="background:var(--green)"></span>Worker Health Check</div>
       <div id="worker-health-display" style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.6">Tap Test to check Worker connectivity and Yahoo auth</div>
@@ -1161,6 +1212,11 @@ v1.7 -- 2026-04-29
       <button class="btn btn-secondary" style="flex:1" onclick="refreshDbgLogDisplay()">Refresh</button>
       <button class="btn btn-secondary" style="flex:1" onclick="clearDbgLog()">Clear</button>
     </div>
+    <hr class="divider">
+    <div class="card-title" style="margin-bottom:10px"><span class="dot" style="background:var(--danger)"></span>Danger Zone</div>
+    <button class="btn btn-secondary" onclick="clearMarketDataCache()" style="margin-bottom:8px;width:100%">Clear Market Data Cache</button>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:10px;line-height:1.5">Clears options chains, price history, and ticker snapshots only. Preserves your watchlist, positions, earnings overrides, income inputs, and all settings.</div>
+    <button class="btn btn-danger" onclick="clearAllDataWithGuard()" style="width:100%">Clear All Cached Data</button>
   </div>
 </div>
 
@@ -1653,8 +1709,16 @@ function init(){
 function _updateBuildLabel(){
   if(!('caches'in window))return;
   caches.keys().then(keys=>{
-    const cn=keys.find(k=>k.startsWith('putseller-v'));
-    if(cn){const el=document.getElementById('app-build-label');if(el)el.textContent='build '+cn.replace('putseller-v','');}
+    // Must match a PURELY NUMERIC suffix, not just the prefix -- a plain
+    // startsWith('income-engine-v') here also matches the separate vendor
+    // cache (income-engine-vendor-v1), since "vendor" itself starts with
+    // "v" right where a digit was assumed to follow. caches.keys() order
+    // isn't guaranteed, so which one .find() landed on before was pure
+    // luck -- when it picked the vendor cache, replace() stripped the
+    // prefix and left "endor-v1" on screen as the "build number". Real
+    // bug, caught directly from a screenshot, not a hypothetical.
+    const cn=keys.find(k=>/^income-engine-v\d+$/.test(k));
+    if(cn){const el=document.getElementById('app-build-label');if(el)el.textContent='build '+cn.replace('income-engine-v','');}
   });
 }
 if(document.readyState==='loading'){
