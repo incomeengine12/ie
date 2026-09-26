@@ -259,8 +259,9 @@ function renderRecentEarningsCards(){
     const streakBadge=e.beatStreak>=2?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(0,200,150,0.2);color:var(--green)">Beat Streak: ${e.beatStreak}Qs</span>`:'';
     const missBadge=e.missStreak>=2?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(255,71,87,0.2);color:var(--red)">Miss Streak: ${e.missStreak}Qs</span>`:'';
     const posBadge=e.hasPositions?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(124,106,247,0.2);color:#b39ddb">You hold this</span>`:'';
-    const reactionStr=e.reactionPct!=null?`<div><span style="color:var(--text3);font-size:9px;display:block">PRICE REACTION</span><span style="color:${e.reactionPct>=0?'var(--green)':'var(--red)'}">${e.reactionPct>=0?'+':''}${e.reactionPct.toFixed(1)}%</span></div>`:'';
-    const excessStr=e.excessReaction!=null?`<div><span style="color:var(--text3);font-size:9px;display:block">VS S&amp;P</span><span style="color:${e.excessReaction>=0?'var(--green)':'var(--red)'}">${e.excessReaction>=0?'+':''}${e.excessReaction.toFixed(1)}%</span></div>`:'';
+    const hourUnknown=!e.earningsHour;
+    const reactionStr=e.reactionPct!=null?`<div title="${hourUnknown?'Announcement hour unknown -- reaction day assumed (BMO convention), may be off by one session':''}"><span style="color:var(--text3);font-size:9px;display:block">PRICE REACTION${hourUnknown?' <span style="color:var(--warn)">&#x2022;</span>':''}</span><span style="color:${e.reactionPct>=0?'var(--green)':'var(--red)'}">${e.reactionPct>=0?'+':''}${e.reactionPct.toFixed(1)}%</span></div>`:'';
+    const excessStr=e.excessReaction!=null?`<div title="${hourUnknown?'Announcement hour unknown -- reaction day assumed (BMO convention), may be off by one session':''}"><span style="color:var(--text3);font-size:9px;display:block">VS S&amp;P</span><span style="color:${e.excessReaction>=0?'var(--green)':'var(--red)'}">${e.excessReaction>=0?'+':''}${e.excessReaction.toFixed(1)}%</span></div>`:'';
     const hvrStr=e.hvrAtReport!=null?`<div><span style="color:var(--text3);font-size:9px;display:block">HVR AT REPORT</span>${e.hvrAtReport.toFixed(0)}</div>`:'';
     const preStr=e.preAnnouncementPrice!=null?`<div><span style="color:var(--text3);font-size:9px;display:block">PRICE BEFORE</span>$${e.preAnnouncementPrice.toFixed(2)}</div>`:'';
     const spark=_recentEarningsSparklineHtml(e.ticker,e.earningsDate,e._hist2y);
@@ -348,12 +349,19 @@ async function loadEarningsTab(){
         ({beatStreak,missStreak}=_computeBeatMissStreak(actuals));
       }catch{}
       // Upcoming EPS estimate: Yahoo earningsTrend (forward-looking, already fetched via quoteSummary)
-      if(epsEst===null){try{const et=snap.earningsTrend;if(et&&et.length){const cur=et.find(p=>p.period==='0q')||et[0];if(cur?.epsMean!=null)epsEst=cur.epsMean;}}catch{}}
-      let news=[];try{const cn=S.get('news_'+t);if(cn)news=cn.items;else{news=await fetchNews(t);S.set('news_'+t,{items:(news||[]).slice(0,10).map(n=>({headline:n.headline,summary:n.summary?n.summary.slice(0,200):null,url:n.url,source:n.source,datetime:n.datetime,sentiment:n.sentiment})),ts:nowPT()});}}catch{}
+      let epsEstEndDate=null;
+      if(epsEst===null){try{const et=snap.earningsTrend;if(et&&et.length){const cur=et.find(p=>p.period==='0q')||et[0];if(cur?.epsMean!=null){epsEst=cur.epsMean;epsEstEndDate=cur.endDate||null;}}}catch{}}
+      // Freshness, relative to THIS card's own earnings event -- only ever
+      // non-null on the event's actual report day itself (see
+      // _earningsFreshnessLabel), the one window where a same-day report
+      // could have already updated earningsTrend/earningsHistoryYahoo
+      // without any other visible signal that it happened.
+      const freshnessLabel=_earningsFreshnessLabel(_effEarningsDate,_effEarningsHour,snap.summaryTsEpoch);
+      let news=[];try{const cn=S.get('news_'+t);if(cn)news=cn.items;else{news=await fetchNews(t);S.set('news_'+t,{items:(news||[]).slice(0,10).map(n=>({headline:n.headline,summary:n.summary?n.summary.slice(0,200):null,url:n.url,source:n.source,datetime:n.datetime,sentiment:n.sentiment})),ts:nowPT(),tsEpoch:Date.now()});}}catch{}
       const ivrVal=computeIVR(t,snap.week52High,snap.week52Low,snap.price);const ivr=ivrInfo(ivrVal);
-      let impliedMove=null;try{const oc=S.get('options_'+t);const res=oc?.data?.optionChain?.result?.[0];if(res&&snap.price){const opts=res.options?.[0];const atmP=(opts?.puts||[]).filter(p=>Math.abs(p.strike-snap.price)/snap.price<0.03);const atmC=(opts?.calls||[]).filter(c=>Math.abs(c.strike-snap.price)/snap.price<0.03);if(atmP.length&&atmC.length){const straddle=((atmP[0].bid+atmP[0].ask)/2)+((atmC[0].bid+atmC[0].ask)/2);impliedMove=(straddle/snap.price*100).toFixed(1);}}}catch{}
+      let impliedMove=null,impliedMoveExp=null;try{if(snap.price){const _cov=_expEntryCovering(t,_effEarningsDate,_effEarningsHour);if(_cov){const _atm=_atmStraddle(_cov.entry,snap.price);if(_atm){impliedMove=(_atm.straddle/snap.price*100).toFixed(1);impliedMoveExp=_cov.date;}}}}catch{} // straddle from the first expiration that spans the report, not merely the nearest one
       const daysUntil=du; // already computed above via daysUntilDate
-      earningsAllData.push({ticker:t,snap,earningsDate:_effEarningsDate,earningsHour:_effEarningsHour,daysUntil,epsEst,epsActualPrev,surprisePrev,surpriseDollarPrev,beatStreak,missStreak,ivrVal,ivrBadge:ivr.badge,impliedMove,news:news.slice(0,3)});
+      earningsAllData.push({ticker:t,snap,earningsDate:_effEarningsDate,earningsHour:_effEarningsHour,daysUntil,epsEst,epsEstEndDate,epsActualPrev,surprisePrev,surpriseDollarPrev,beatStreak,missStreak,ivrVal,ivrBadge:ivr.badge,impliedMove,impliedMoveExp,freshnessLabel,news:news.slice(0,3)});
     }catch{}
     if(i<watchlist.length-1)await sleep(400);
   }
@@ -379,18 +387,19 @@ function renderEarningsCards(isLive=false){
     let guidance='';
     if(e.daysUntil<=14){guidance='Earnings within 2 weeks -- avoid options expirations that straddle this date. ';if(e.ivrVal&&e.ivrVal>60)guidance+='IV elevated ahead of earnings -- go wider OTM if selling options. ';guidance+='Consider waiting until after the announcement for IV crush to remove event risk.';}
     else if(e.daysUntil<=35){guidance='Earnings in 2-5 weeks. Confirm your expirations do not straddle this date. ';if(e.beatStreak>=3)guidance+='Strong beat streak -- put selling may be favorable on post-announcement pullbacks. ';if(e.missStreak>=2)guidance+='Recent miss streak -- elevated event risk, consider wider strikes or avoiding this name around earnings. ';}
-    else{guidance='Earnings far enough out that near-term options are generally safe. ';if(e.impliedMove)guidance+=`Market implies +/-${e.impliedMove}% move on earnings day.`;}
-    const newsHtml=e.news?.length?e.news.map(n=>{const s=newsSentiment(n.headline);return`<div style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-bottom:3px"><span style="${s.css}">${sentDot(s)}</span> ${n.headline.slice(0,80)}...</div>`;}).join(''):'';
+    else{guidance='Earnings far enough out that near-term options are generally safe. ';if(e.impliedMove)guidance+=`Options imply about +/-${e.impliedMove}% by the ${_expLabel(e.impliedMoveExp)} expiration, which spans earnings.`;}
+    const newsHtml=e.news?.length?e.news.map(n=>{const s=newsSentiment(n.headline);return`<div style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-bottom:3px"><span style="${s.css}">${sentDot(s)}</span> ${_escHtml(n.headline.slice(0,80))}...</div>`;}).join(''):'';
     const starLabel=starred.has(e.ticker)?'<span style="font-size:15px;color:#ffc107;margin-left:4px" title="Starred">&#9733;</span>':'';
     return`<div class="${cardCls}" onclick="navigateToTicker('${e.ticker}')">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
         <div><span style="font-family:var(--sans);font-size:20px;font-weight:700;color:var(--accent)">${e.ticker}</span>${starLabel}${e.snap.price?`<span style="font-family:var(--mono);font-size:13px;color:var(--text2);margin-left:8px">$${e.snap.price.toFixed(2)}</span>`:''}</div>
         <div style="text-align:right"><div style="font-family:var(--mono);font-size:11px;font-weight:600;color:var(--warn)">${urgency}</div><div style="font-family:var(--mono);font-size:11px;color:var(--text2)">${e.earningsDate}${timing}</div></div>
       </div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">${e.ivrBadge||''}${e.impliedMove?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(124,106,247,0.2);color:#b39ddb">Implied +/-${e.impliedMove}%</span>`:''}${e.beatStreak>=2?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(0,200,150,0.2);color:var(--green)">Beat Streak: ${e.beatStreak}Qs</span>`:''}${e.missStreak>=2?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(255,71,87,0.2);color:var(--red)">Miss Streak: ${e.missStreak}Qs</span>`:''}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">${e.ivrBadge||''}${e.impliedMove?`<span title="From the ${_expLabel(e.impliedMoveExp)} options expiration (first one spanning earnings)" style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(124,106,247,0.2);color:#b39ddb">Implied +/-${e.impliedMove}%</span>`:''}${e.beatStreak>=2?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(0,200,150,0.2);color:var(--green)">Beat Streak: ${e.beatStreak}Qs</span>`:''}${e.missStreak>=2?`<span style="font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(255,71,87,0.2);color:var(--red)">Miss Streak: ${e.missStreak}Qs</span>`:''}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;font-family:var(--mono);font-size:11px">
-        <div><span style="color:var(--text3);font-size:9px;display:block">EPS ESTIMATE</span>${e.epsEst!==null?`$${e.epsEst.toFixed(2)}`:'N/A'}</div>
+        <div><span style="color:var(--text3);font-size:9px;display:block">EPS ESTIMATE${e.epsEstEndDate?' (period end '+e.epsEstEndDate+')':''}</span>${e.epsEst!==null?`$${e.epsEst.toFixed(2)}`:'N/A'}</div>
         <div><span style="color:var(--text3);font-size:9px;display:block">PRIOR ACTUAL</span>${e.epsActualPrev!==null?`$${e.epsActualPrev.toFixed(2)}`:'N/A'}</div>
+        ${e.freshnessLabel?`<div style="grid-column:span 2"><span style="color:var(--text2)">${e.freshnessLabel}</span></div>`:''}
         ${e.surprisePrev!==null?`<div style="grid-column:span 2"><span style="color:${e.surprisePrev>0?'var(--green)':'var(--red)'}">${e.surprisePrev>0?'+':''}${e.surprisePrev.toFixed(1)}% surprise last Q</span></div>`
           :e.surpriseDollarPrev!=null?`<div style="grid-column:span 2"><span style="color:${e.surpriseDollarPrev>0?'var(--green)':'var(--red)'}" title="Estimate too close to zero for a meaningful percentage">${e.surpriseDollarPrev>0?'+':''}$${e.surpriseDollarPrev.toFixed(2)} surprise last Q</span></div>`
           :''}

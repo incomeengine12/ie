@@ -82,18 +82,73 @@ function _effectiveFomcDates(){
 }
 const _MONTH_ABBR={Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
 
+// Classifies a PAST meeting from the New York Fed's official target-range
+// history (effrRows: ascending-by-date {effectiveDate,percentRate,
+// targetRateFrom,targetRateTo}), rather than inferring the outcome from the
+// futures-implied rate. Returns null -- never a guess -- when the window
+// doesn't bracket the meeting date on both sides (most often: the meeting
+// happened very recently and EFFR hasn't published a post-meeting business
+// day yet), or when the lower/upper bounds moved by different amounts,
+// which real FOMC decisions don't do -- that pattern means something's off
+// with the data for this window, not a valid non-parallel outcome, so it's
+// safer to fall back to the futures-implied method than report it.
+function _resolveMeetingFromEffr(meetingDateStr,effrRows){
+  if(!effrRows||!effrRows.length)return null;
+  let before=null,after=null;
+  for(const row of effrRows){
+    if(row.effectiveDate<meetingDateStr)before=row; // rows are ascending, so this ends up the LATEST one strictly before
+    else if(row.effectiveDate>meetingDateStr&&!after)after=row; // first one strictly after
+  }
+  if(!before||!after)return null;
+  const lowerChangeBp=Math.round((after.targetRateFrom-before.targetRateFrom)*100);
+  const upperChangeBp=Math.round((after.targetRateTo-before.targetRateTo)*100);
+  if(lowerChangeBp!==upperChangeBp)return null;
+  return{moveBp:lowerChangeBp,resolvedRate:after.percentRate};
+}
+
 // Simple version: assumes at most one standard 25bp step per meeting.
 // Correct the large majority of the time; a genuine 50bp-move scenario
 // would show as a probability this model can't fully represent (capped at
 // 100% for whichever direction), which is a known, accepted simplification
 // for a first version rather than the fuller multi-outcome treatment CME's
 // own methodology uses.
-function _computeFedMeetingProbabilities(fedFutures){
+// Computes the earliest date EFFR history is actually needed from, based
+// on the earliest month really present in THIS fetch's fedFutures window
+// -- rather than a flat lookback that's either wastefully wide most of
+// the time or, near a month boundary, not wide enough (see the
+// fetchEffrHistory comment in api.js). fetchFedFundsFutures() never looks
+// back further than one month before today, so a meeting earlier than
+// that month's start could never be resolved through THIS window anyway
+// -- a 10-day buffer just covers ordinary settlement/holiday lag right
+// at that boundary.
+function _earliestEffrStartNeeded(fedFutures){
+  if(!fedFutures||!fedFutures.length)return null;
+  let earliestYM=null;
+  fedFutures.forEach(c=>{
+    const[mAbbr,yStr]=(c.month||'').split(' ');
+    const m=_MONTH_ABBR[mAbbr],y=parseInt(yStr);
+    if(m==null||isNaN(y))return;
+    const ym=y*12+m;
+    if(earliestYM==null||ym<earliestYM)earliestYM=ym;
+  });
+  if(earliestYM==null)return null;
+  const y=Math.floor(earliestYM/12),m=earliestYM%12;
+  return addDays(new Date(y,m,1),-10);
+}
+
+function _computeFedMeetingProbabilities(fedFutures,effrRows){
   if(!fedFutures||!fedFutures.length)return[];
   const STEP=0.25; // standard FOMC move size, percentage points
   const meetingDates=_effectiveFomcDates();
   const results=[];
   let currentRate=null;
+  // Tracks the (year*12+month) of the last contract actually processed,
+  // to detect a gap in the monthly sequence (see the invalidation check
+  // inside the loop below) -- a month whose contract simply isn't present
+  // in fedFutures at all (a failed fetch with no prior cache to carry
+  // forward) rather than one marked .stale (which IS still present, just
+  // outdated, and is a perfectly fine chain link).
+  let lastYM=null;
   // Self-healing fallback, keyed by meeting date rather than remembering
   // only the single most-recently-resolved meeting -- the earlier
   // single-value version had a real blind spot: if a LATER meeting (say,
@@ -119,30 +174,146 @@ function _computeFedMeetingProbabilities(fedFutures){
     historyChanged=true;
   }
   if(oldSingle){S.del('fomc_last_known_rate');}
+  // One-time migration: builds before 495 wrote the live FORECAST rate into
+  // history for every future meeting on every fetch, not just resolved
+  // outcomes (see the 495 changelog). Two separate contamination shapes
+  // that migration needs to handle:
+  // (a) Still future-dated as of today -- unambiguously a leftover
+  //     forecast (a genuinely resolved meeting can only be keyed by a
+  //     PAST date), purged unconditionally.
+  // (b) Already past-dated, but with none of the fields this build always
+  //     writes (source/resolvedAt/moveBp) -- this is what (a) becomes
+  //     once enough time passes for the meeting date to arrive, and it's
+  //     NOT caught by the future-only check above. Confirmed via direct
+  //     reproduction that leaving it in place is a real, severe hole: it
+  //     can get read completely unconditionally as another (later)
+  //     meeting's PRE-meeting baseline a few lines below (the
+  //     `history[priorMeetingDate]` lookup), with no source check at all
+  //     -- an old contaminated guess silently distorted an ordinary
+  //     meeting into reading as a "1275bp cut" in testing. Every entry
+  //     this build itself ever writes always carries a `source`, so
+  //     "past-dated but source-less" can only mean pre-495 debris -- safe
+  //     to drop unconditionally, same as (a). If that meeting's own month
+  //     is still reachable in a future fetch window, it gets a clean,
+  //     properly-sourced resolution the next time it's actually
+  //     processed; if it's aged out of the window entirely, dropping it
+  //     just means an honest "insufficientBaseline" for anything that
+  //     would have leaned on it, instead of a silent wrong answer.
+  const _todayStr=_todayET();
+  Object.keys(history).forEach(d=>{
+    const entry=history[d];
+    if(d>_todayStr||!entry||!entry.source){delete history[d];historyChanged=true;}
+  });
   for(let i=0;i<fedFutures.length;i++){
     const c=fedFutures[i];
     const[mAbbr,yStr]=(c.month||'').split(' ');
     const m=_MONTH_ABBR[mAbbr],y=parseInt(yStr);
     if(m==null||isNaN(y))continue;
+    // Gap detection: if this contract's month isn't the calendar month
+    // immediately after the last one actually processed, currentRate (if
+    // set) was computed from a contract too far back to trust as THIS
+    // month's starting point -- using it anyway silently attributes an
+    // entire multi-month rate move to whatever few days happen to fall on
+    // either side of a meeting, which can produce a wildly wrong implied
+    // move (confirmed via direct reproduction: a missing September
+    // contract between a real Aug and Oct made an ordinary Oct meeting
+    // read as a "250bp cut"). The meeting-free branch just below
+    // re-anchors regardless of any gap -- its own priced rate needs no
+    // predecessor to be trustworthy -- so this only actually changes
+    // anything for a meeting landing right after a gap, and even then the
+    // existing history-based fallback a few lines down still gets a fair,
+    // fully independent shot at recovering a real baseline.
+    const thisYM=y*12+m;
+    if(lastYM!=null&&thisYM!==lastYM+1)currentRate=null;
+    lastYM=thisYM;
     const daysInMonth=new Date(y,m+1,0).getDate();
     const meetingDateStr=meetingDates.find(d=>{
       const dd=new Date(d+'T12:00:00Z');
       return dd.getFullYear()===y&&dd.getMonth()===m;
     });
     if(!meetingDateStr){
-      // No meeting this month -- if we don't have a baseline rate yet,
-      // this month's implied rate IS the baseline (nothing moves it).
-      if(currentRate==null)currentRate=c.impliedRate;
+      // No meeting this month -- its implied rate becomes the new
+      // baseline, always (not just when we don't have one yet) -- UNLESS
+      // this specific contract is stale (carried forward from a fetch
+      // that didn't return a usable quote). A stale meeting-free month
+      // could be frozen at a PRE-meeting price if a decision happened
+      // after its last successful quote but before this one -- using it
+      // as a baseline for whatever comes next would silently feed a
+      // wrong starting point into a live probability calculation. Simply
+      // not touching currentRate here is the safe move: either an
+      // earlier trustworthy anchor is already in place and stays
+      // correct, or currentRate is still null and falls through to the
+      // existing history-based fallback (or an honest
+      // "insufficientBaseline") a few lines below -- never a fabricated
+      // number either way.
+      if(!c.stale)currentRate=c.impliedRate;
       continue;
     }
     if(currentRate==null){
       const idx=meetingDates.indexOf(meetingDateStr);
       const priorMeetingDate=idx>0?meetingDates[idx-1]:null;
-      if(priorMeetingDate&&history[priorMeetingDate])currentRate=history[priorMeetingDate].rate;
+      // Require .source -- an entry without one can only be pre-495
+      // legacy contamination (see the migration comment above), and the
+      // migration now deletes those anyway; this check is the second,
+      // caller-independent line of defense in case one ever slips through
+      // some other way. An unsourced rate must never silently become
+      // another meeting's baseline.
+      if(priorMeetingDate&&history[priorMeetingDate]?.source)currentRate=history[priorMeetingDate].rate;
     }
     const meetingDay=new Date(meetingDateStr+'T12:00:00Z').getDate();
-    const daysBefore=meetingDay-1;
+    // The new rate isn't effective until the day AFTER the decision is
+    // announced, so the meeting date itself belongs to the PRE-meeting
+    // bucket -- matches CME's own published day-count convention (e.g. a
+    // Sept 21 meeting in a 30-day month is 21 pre-meeting days, 9 post,
+    // not 20/10). Previously this used `meetingDay-1`, which silently
+    // shifted every meeting's split by one day.
+    const daysBefore=meetingDay;
     const daysAfter=daysInMonth-daysBefore;
+    const meetingIsPast=meetingDateStr<_todayET();
+    // For a PAST meeting, the authoritative NY Fed resolution (or an
+    // existing nyfed-official history entry) needs no futures baseline at
+    // all -- it's a fact, sourced from the actual target-range history,
+    // completely independent of currentRate/postMeetingRate. Try it FIRST,
+    // before the baseline check below. This used to sit AFTER that check,
+    // which meant a meeting that had ALREADY been decided, with valid
+    // official data bracketing it, could still be reported as "odds
+    // unavailable" purely because the futures baseline was missing -- a
+    // real correctness bug (a completed meeting doesn't need one), not
+    // just a cosmetic ordering choice. Everything past this block DOES
+    // need a baseline (the futures-implied fallback computes a move
+    // relative to one, same as the forecast branch below it), so those
+    // stay exactly where they were, gated behind the same check as before.
+    if(meetingIsPast){
+      const nyfed=_resolveMeetingFromEffr(meetingDateStr,effrRows);
+      if(nyfed){
+        const outcome=nyfed.moveBp===0?'hold':(nyfed.moveBp>0?'hike'+nyfed.moveBp:'cut'+(-nyfed.moveBp));
+        results.push({month:c.month,meetingDate:meetingDateStr,resolved:true,outcome,source:'nyfed-official'});
+        currentRate=nyfed.resolvedRate;
+        if(!history[meetingDateStr]||history[meetingDateStr].rate!==currentRate||history[meetingDateStr].source!=='nyfed-official'){
+          history[meetingDateStr]={rate:currentRate,source:'nyfed-official',resolvedAt:_todayStr,moveBp:nyfed.moveBp};
+          historyChanged=true;
+        }
+        continue;
+      }
+      // This call didn't have (or couldn't bracket the meeting with) fresh
+      // EFFR data -- most commonly a caller that doesn't pass effrRows at
+      // all (js/options.js used to be exactly this, before it was fixed
+      // to pass the cached rows -- kept here as a second, caller-
+      // independent line of defense) or a temporary EFFR fetch failure.
+      // Reuse an existing nyfed-official record for this exact meeting if
+      // one's already been resolved -- also independent of any baseline,
+      // and never let a weaker read downgrade a stronger one on file.
+      const existing=history[meetingDateStr];
+      if(existing&&existing.source==='nyfed-official'&&existing.moveBp!=null){
+        const outcome=existing.moveBp===0?'hold':(existing.moveBp>0?'hike'+existing.moveBp:'cut'+(-existing.moveBp));
+        results.push({month:c.month,meetingDate:meetingDateStr,resolved:true,outcome,source:'nyfed-official'});
+        currentRate=existing.rate;
+        continue; // no history write -- nothing changed
+      }
+      // Neither path resolved it officially -- the only thing left is the
+      // futures-implied fallback, which DOES need a baseline. Fall
+      // through to the same check every other path uses.
+    }
     if(currentRate==null||daysAfter<=0){
       // Can't cleanly establish a pre-meeting baseline for this specific
       // meeting -- most commonly, it falls in the very first fetched
@@ -163,25 +334,147 @@ function _computeFedMeetingProbabilities(fedFutures){
     // blends the known pre-meeting rate with the unknown post-meeting rate.
     const postMeetingRate=(c.impliedRate*daysInMonth-currentRate*daysBefore)/daysAfter;
     const impliedMove=postMeetingRate-currentRate;
-    let pCut=0,pHike=0;
-    if(impliedMove<0)pCut=Math.min(Math.abs(impliedMove)/STEP,1);
-    else if(impliedMove>0)pHike=Math.min(impliedMove/STEP,1);
-    const pHold=1-pCut-pHike;
+    if(meetingIsPast){
+      // Reaching here means NY Fed couldn't resolve this meeting (not
+      // covered yet, or effrRows unavailable) and there was no existing
+      // official record to reuse -- the only thing left is the same
+      // futures-implied classification used before this build, and even
+      // then only when this month's contract was genuinely fresh this
+      // fetch (c.stale) -- a carried-forward contract reflects whatever
+      // it last knew, not necessarily anything from after the meeting, so
+      // confidently stating an outcome from stale data would risk being
+      // flatly wrong rather than just imprecise.
+      if(c.stale){
+        // Not actually resolved -- explicitly NOT written to history, which
+        // is the core of the build-495 fix: a stale guess (or, before
+        // that build, a live forecast) read back later as though it were
+        // a settled fact is exactly the contamination that replaced.
+        results.push({month:c.month,meetingDate:meetingDateStr,outcomePending:true});
+        currentRate=postMeetingRate;
+        continue;
+      }
+      const steps=Math.round(impliedMove/STEP);
+      const outcome=steps===0?'hold':(steps>0?'hike'+(steps*25):'cut'+(-steps*25));
+      results.push({month:c.month,meetingDate:meetingDateStr,resolved:true,outcome,source:'futures-implied'});
+      currentRate=postMeetingRate;
+      if(!history[meetingDateStr]||history[meetingDateStr].rate!==postMeetingRate||history[meetingDateStr].source!=='futures-implied'){
+        history[meetingDateStr]={rate:postMeetingRate,source:'futures-implied',resolvedAt:_todayStr,moveBp:steps*25};
+        historyChanged=true;
+      }
+      continue;
+    }
+    // Generalized outcome split: rather than clamping at a single 25bp
+    // step (the old model read anything >=25bp as "100% cut25"), express
+    // the implied move as a whole number of 25bp steps plus a leftover
+    // fraction -- that fraction IS the probability split between the two
+    // adjacent outcomes it's priced between. A 0.9-step move (<25bp)
+    // splits between hold and a single 25bp step, reproducing the OLD
+    // model exactly. A 1.48-step move (~37bp) splits between a 25bp move
+    // and a 50bp move instead of capping at 100% either way. No special-
+    // casing by magnitude -- this generalizes to a 75bp+ move the same way.
+    const stepsFloat=impliedMove/STEP;
+    const absSteps=Math.abs(stepsFloat);
+    const wholeSteps=Math.floor(absSteps);
+    const frac=absSteps-wholeSteps; // probability mass on the LARGER of the two adjacent outcomes
+    const dirSign=impliedMove<0?-1:1; // only matters when wholeSteps>0; a true 0bp move is direction-less anyway
+    const smallerMoveBp=wholeSteps===0?0:wholeSteps*25*dirSign; // avoid a -0 hold entry on the cut side
+    const largerMoveBp=(wholeSteps+1)*25*dirSign;
+    // Complement, not independently rounded, so the two always sum to
+    // exactly 100 regardless of rounding direction (see "Probability mass
+    // preserved through successive meetings" in the test suite).
+    const smallerProb=Math.round((1-frac)*100);
+    const largerProb=100-smallerProb;
+    const outcomes=[{moveBp:smallerMoveBp,probability:smallerProb}];
+    if(largerProb>0)outcomes.push({moveBp:largerMoveBp,probability:largerProb});
+    let pHold=0,pAnyCut=0,pAnyHike=0;
+    outcomes.forEach(o=>{
+      if(o.moveBp===0)pHold+=o.probability;
+      else if(o.moveBp<0)pAnyCut+=o.probability;
+      else pAnyHike+=o.probability;
+    });
     results.push({
       month:c.month,meetingDate:meetingDateStr,
-      pHold:Math.round(pHold*100),pCut25:Math.round(pCut*100),pHike25:Math.round(pHike*100),
+      outcomes,pHold,pAnyCut,pAnyHike,
+      // Kept as aliases (not renamed) so js/options.js's existing
+      // m.pCut25/m.pHike25 reads keep working unchanged -- now correctly
+      // reflecting the probability of ANY cut/hike (which, for an
+      // ordinary <25bp move, is numerically identical to the old "25bp
+      // move" probability; it only differs -- for the better, since a
+      // 50bp-priced meeting should still trip the options-tab warning --
+      // once a larger move is genuinely being priced in).
+      pCut25:pAnyCut,pHike25:pAnyHike,
     });
-    currentRate=postMeetingRate; // chain forward -- next meeting's baseline is this one's outcome
-    if(!history[meetingDateStr]||history[meetingDateStr].rate!==postMeetingRate){
-      history[meetingDateStr]={rate:postMeetingRate};
-      historyChanged=true;
-    }
+    // Chain forward for SUBSEQUENT meetings within this same calculation run
+    // only -- deliberately NOT persisted to history. A forecast is exactly
+    // that: it can (and normally will) change on the next fetch as futures
+    // reprice, so writing it to fomc_meeting_history would let a stale
+    // guess be read back later as though it were a settled fact -- see the
+    // meetingIsPast branch above for where entries actually get written.
+    currentRate=postMeetingRate;
   }
   if(historyChanged)S.set('fomc_meeting_history',history);
   return results;
 }
 
-function _renderMarketContent(el,{ts,isLive,tsEpoch,fredTs,fredTsEpoch,fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths,tbill3m,tbill5y,tbill10y,marketNews,derived}){
+function _isCurrentOrLaterMonth(monthLabel,now){
+  const[mAbbr,yStr]=(monthLabel||'').split(' ');
+  const m=_MONTH_ABBR[mAbbr],y=parseInt(yStr);
+  if(m==null||isNaN(y))return true; // malformed label -- don't silently drop it
+  return(y*12+m)>=(now.getFullYear()*12+now.getMonth());
+}
+// Fed Funds Futures display filter: current month forward only. The
+// underlying fedFutures array passed to callers of this (and to
+// _computeFedMeetingProbabilities/_earliestEffrStartNeeded) deliberately
+// still includes the prior month -- it's the one thing that can bootstrap
+// a baseline (or widen the NY Fed data window) when the current month
+// itself is a meeting month with nothing meeting-free earlier in the
+// window. This only trims what's actually RENDERED: once a prior month's
+// own meeting (if any) has resolved via NY Fed, there's nothing left for
+// a person to usefully read in that row; showing it anyway just makes an
+// otherwise forward-looking table look like it covers a stale extra
+// month that isn't actually relevant anymore.
+// Computes the table-level summary (or explicit unavailability) for the
+// Fed Funds Futures card, given only what's actually DISPLAYED. Returns
+// {tableUnavailable:true} when nothing survives the display filter --
+// deliberately never lets firstRate/lastRate come back undefined and
+// silently propagate into NaN arithmetic: NaN comparisons in JS are
+// always false, which made the summary text fall through to its LAST
+// branch every time regardless of what actually happened (a confidently
+// wrong "2+ hikes" conclusion from garbage data, not just a blank or an
+// honest error). Otherwise returns {tableUnavailable:false,totalBps,summary}
+// derived entirely from displayFutures itself, guaranteeing the summary
+// always covers exactly the months actually shown, never a hidden one.
+function _fedFuturesSummary(displayFutures){
+  if(!displayFutures||!displayFutures.length)return{tableUnavailable:true,totalBps:0,summary:null};
+  const firstRate=displayFutures[0]?.impliedRate;
+  const lastRate=displayFutures[displayFutures.length-1]?.impliedRate;
+  const totalBps=Math.round((lastRate-firstRate)*100);
+  const _absBps=Math.abs(totalBps);
+  // Symmetric by construction across both directions, rather than the
+  // previous cut-only branches with a same-text fallback for anything
+  // that didn't match -- that fallback silently caught positive
+  // (hike-direction) totalBps too, since nothing there checked sign,
+  // producing "Markets pricing 1-2 cuts" even when the underlying
+  // futures prices were falling (implied rate rising, a hike signal) --
+  // exactly contradicting the correctly-signed meeting-by-meeting
+  // breakdown below it.
+  const summary=_absBps<25
+    ?'Markets pricing no change'
+    :(totalBps<0
+        ?(_absBps<50?'Markets pricing ~1 cut':'Markets pricing 2+ cuts')
+        :(_absBps<50?'Markets pricing ~1 hike':'Markets pricing 2+ hikes'));
+  return{tableUnavailable:false,totalBps,summary};
+}
+
+function _fedFuturesRefMonth(displayFutures,nowLabel){
+  return(displayFutures.find(c=>c.month===nowLabel)||displayFutures[0])?.month||null;
+}
+
+function _filterFedFuturesForDisplay(fedFutures,now){
+  return(fedFutures||[]).filter(c=>_isCurrentOrLaterMonth(c.month,now));
+}
+
+function _renderMarketContent(el,{ts,isLive,tsEpoch,fredTs,fredTsEpoch,fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths,effrRows,tbill3m,tbill5y,tbill10y,marketNews,derived}){
   const{tb3Current,tb5yCurrent,tb10yCurrent,tb3Yr,tb5yYr,tb10yYr,spread35,spread310,spread510,spreadStr35,spreadStr310,spreadStr510,spyiYield,nbosYield,vixCurrent,spCurrent,spChg,spChgPct,nqCurrent,nqChg,nqChgPct,spLabels,spData}=derived;
 
   el.innerHTML=`
@@ -218,63 +511,80 @@ function _renderMarketContent(el,{ts,isLive,tsEpoch,fredTs,fredTsEpoch,fedFuture
       // occupy index 0 (see fetchFedFundsFutures), and that prior month's
       // own fetch can independently succeed or fail, position alone no
       // longer reliably identifies "now." Matched by month label instead,
-      // with a same-position fallback only if the current month's own
-      // contract somehow isn't present at all.
+      // with a fallback to the first DISPLAYED contract (never a hidden
+      // one) only if the current month's own contract somehow isn't
+      // present at all -- see the comment on refMonth below.
       const _nowD=new Date();
       const _nowLabel=new Date(_nowD.getFullYear(),_nowD.getMonth(),1).toLocaleDateString('en-US',{month:'short',year:'numeric'});
-      const _nowFutIdx=fedFutures.findIndex(c=>c.month===_nowLabel);
-      const refIdx=_nowFutIdx>=0?_nowFutIdx:0;
-      const firstRate=fedFutures[refIdx]?.impliedRate;
-      const lastRate=fedFutures[fedFutures.length-1]?.impliedRate;
-      // Compute cumulative cut/hike vs the current-month contract
-      const rows=fedFutures.map((c,i)=>{
-        const delta=i===refIdx?0:parseFloat((c.impliedRate-fedFutures[refIdx].impliedRate).toFixed(3));
-        const bps=Math.round(delta*100);
-        const col=bps<-5?'var(--green)':bps>5?'var(--red)':'var(--text2)';
-        const sign=bps>0?'+':'';
-        return '<tr>'
-          +'<td style="color:var(--text2)">'+c.month+(c.stale?' <span style="color:#64b5f6;font-size:8px" title="Carried forward -- this contract did not return a usable quote this fetch">&#9679;</span>':'')+'</td>'
-          +'<td style="font-family:var(--mono)">'+c.price.toFixed(3)+'</td>'
-          +'<td style="font-family:var(--mono)">'+c.impliedRate.toFixed(3)+'%</td>'
-          +'<td style="color:'+col+';font-family:var(--mono)">'+(i===refIdx?'—':sign+bps+'bp')+'</td>'
-          +'</tr>';
-      }).join('');
-      const totalBps=Math.round((lastRate-firstRate)*100);
-      const _absBps=Math.abs(totalBps);
-      // Symmetric by construction across both directions, rather than the
-      // previous cut-only branches with a same-text fallback for anything
-      // that didn't match -- that fallback silently caught positive
-      // (hike-direction) totalBps too, since nothing there checked sign,
-      // producing "Markets pricing 1-2 cuts" even when the underlying
-      // futures prices were falling (implied rate rising, a hike signal)
-      // -- exactly contradicting the correctly-signed meeting-by-meeting
-      // breakdown below it.
-      const summary=_absBps<25
-        ?'Markets pricing no change'
-        :(totalBps<0
-            ?(_absBps<50?'Markets pricing ~1 cut':'Markets pricing 2+ cuts')
-            :(_absBps<50?'Markets pricing ~1 hike':'Markets pricing 2+ hikes'));
-      const meetingProbs=_computeFedMeetingProbabilities(fedFutures);
+      const displayFutures=_filterFedFuturesForDisplay(fedFutures,_nowD);
+      // Only the raw table/summary below can be genuinely unavailable.
+      // Meeting-by-meeting odds (further down) are computed from the
+      // full internal fedFutures plus NY Fed data independently -- a
+      // past meeting can still resolve officially even when every
+      // current/forward futures contract is unavailable, so that section
+      // is never suppressed just because the table above it is.
+      const{tableUnavailable,totalBps,summary}=_fedFuturesSummary(displayFutures);
+      let rows='';
+      if(!tableUnavailable){
+        // Reference for deltas: the current month's own contract, if
+        // present -- otherwise the first DISPLAYED contract, never a
+        // hidden, filtered-out month. The display filter can leave a
+        // prior month (e.g. August, viewed in September) sitting at
+        // fedFutures[0] internally even though it's no longer shown --
+        // falling back to that would make every visible delta, and the
+        // total, silently reference a number that isn't on the screen
+        // anywhere.
+        const refMonth=_fedFuturesRefMonth(displayFutures,_nowLabel);
+        const firstRate=displayFutures[0]?.impliedRate;
+        // Compute cumulative cut/hike vs the reference contract
+        rows=displayFutures.map(c=>{
+          const isRef=c.month===refMonth;
+          const delta=isRef?0:parseFloat((c.impliedRate-firstRate).toFixed(3));
+          const bps=Math.round(delta*100);
+          const col=bps<-5?'var(--green)':bps>5?'var(--red)':'var(--text2)';
+          const sign=bps>0?'+':'';
+          return '<tr>'
+            +'<td style="color:var(--text2)">'+c.month+(c.stale?' <span style="color:#64b5f6;font-size:8px" title="Carried forward -- this contract did not return a usable quote this fetch. Last known good: '+(c.staleAsOf||'unknown')+'">&#9679;</span>':'')+'</td>'
+            +'<td style="font-family:var(--mono)">'+c.price.toFixed(3)+'</td>'
+            +'<td style="font-family:var(--mono)">'+c.impliedRate.toFixed(3)+'%</td>'
+            +'<td style="color:'+col+';font-family:var(--mono)">'+(isRef?'—':sign+bps+'bp')+'</td>'
+            +'</tr>';
+        }).join('');
+      }
+      const meetingProbs=_computeFedMeetingProbabilities(fedFutures,effrRows);
       const probRows=meetingProbs.map(p=>{
         const dateLabel=new Date(p.meetingDate+'T12:00:00Z').toLocaleDateString('en-US',{month:'short',day:'numeric'});
         if(p.insufficientBaseline){
           return '<div style="font-family:var(--mono);font-size:10px;color:var(--text3);padding:3px 0">'+dateLabel+' meeting: odds unavailable -- no earlier meeting-free month in this window to establish a baseline rate</div>';
         }
-        const parts=[];
-        if(p.pHold>0)parts.push(p.pHold+'% hold');
-        if(p.pCut25>0)parts.push(p.pCut25+'% cut 25bp');
-        if(p.pHike25>0)parts.push(p.pHike25+'% hike 25bp');
+        if(p.outcomePending){
+          return '<div style="font-family:var(--mono);font-size:10px;color:#64b5f6;padding:3px 0">'+dateLabel+' meeting: already occurred, outcome pending fresher data (this month\'s contract is using a carried-forward value)</div>';
+        }
+        if(p.resolved){
+          const outcomeLabel=p.outcome==='hold'?'HELD':(p.outcome.startsWith('hike')?'HIKED '+p.outcome.slice(4)+'bp':'CUT '+p.outcome.slice(3)+'bp');
+          const srcLabel=p.source==='nyfed-official'?'NY Fed official':'futures-implied, unconfirmed';
+          return '<div style="font-family:var(--mono);font-size:10px;color:var(--text2);padding:3px 0">'+dateLabel+' meeting: <span style="color:var(--accent)">'+outcomeLabel+'</span> ('+srcLabel+')</div>';
+        }
+        const parts=(p.outcomes||[]).map(o=>{
+          if(o.probability<=0)return null; // e.g. a clean, exact-fraction move with nothing on the larger side
+          if(o.moveBp===0)return o.probability+'% hold';
+          return o.probability+'% '+(o.moveBp<0?'cut':'hike')+' '+Math.abs(o.moveBp)+'bp';
+        }).filter(Boolean);
         return '<div style="font-family:var(--mono);font-size:10px;color:var(--text2);padding:3px 0">'+dateLabel+' meeting: '+parts.join(', ')+'</div>';
       }).join('');
+      const displayFailedMonths=(fedFuturesFailedMonths||[]).filter(m=>_isCurrentOrLaterMonth(m,_nowD));
+      const displayStaleMonths=(fedFuturesStaleMonths||[]).filter(m=>_isCurrentOrLaterMonth(m,_nowD));
       return '<div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Fed Funds Futures (CME Implied Rates)</div>'
         +'<div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:8px">30-day futures price → implied rate (100 − price). Delta vs near-month contract.</div>'
-        +'<div class="options-table-wrap"><table class="options-table">'
-        +'<thead><tr><th style="text-align:left">Month</th><th>Price</th><th>Implied Rate</th><th>Δ vs Now</th></tr></thead>'
-        +'<tbody>'+rows+'</tbody></table></div>'
-        +'<div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:8px">'+summary+' ('+fedFutures.length+' months tracked, '+Math.abs(totalBps)+'bp total)</div>'
-        +(fedFuturesFailedMonths&&fedFuturesFailedMonths.length?'<div style="font-family:var(--mono);font-size:9px;color:var(--warn);margin-top:4px">Data unavailable for: '+fedFuturesFailedMonths.join(', ')+' -- that contract didn\'t return a usable quote this fetch (and no prior successful value exists to fall back on), so those meetings (if any fall in these months) are missing below, not intentionally excluded.</div>':'')
-        +(fedFuturesStaleMonths&&fedFuturesStaleMonths.length?'<div style="font-family:var(--mono);font-size:9px;color:#64b5f6;margin-top:4px">Using last known data for: '+fedFuturesStaleMonths.join(', ')+' -- that contract didn\'t return a usable quote this fetch, so the most recent successful value is shown instead of nothing.</div>':'')
-        +(probRows?'<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--surface3)"><div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-bottom:2px">Meeting-by-meeting odds (simplified -- assumes at most one 25bp step per meeting):</div>'+probRows+'</div>':'')
+        +(tableUnavailable
+          ?'<div style="font-family:var(--mono);font-size:11px;color:var(--text3)">Current and forward contract data unavailable.</div>'
+          :'<div class="options-table-wrap"><table class="options-table">'
+            +'<thead><tr><th style="text-align:left">Month</th><th>Price</th><th>Implied Rate</th><th>Δ vs Now</th></tr></thead>'
+            +'<tbody>'+rows+'</tbody></table></div>'
+            +'<div style="font-family:var(--mono);font-size:11px;color:var(--accent);margin-top:8px">'+summary+' ('+displayFutures.length+' months tracked, '+Math.abs(totalBps)+'bp total)</div>')
+        +(displayFailedMonths.length?'<div style="font-family:var(--mono);font-size:9px;color:var(--warn);margin-top:4px">Data unavailable for: '+displayFailedMonths.join(', ')+' -- that contract didn\'t return a usable quote this fetch (and no prior successful value exists to fall back on), so those meetings (if any fall in these months) are missing below, not intentionally excluded.</div>':'')
+        +(displayStaleMonths.length?'<div style="font-family:var(--mono);font-size:9px;color:#64b5f6;margin-top:4px">Using last known data for: '+displayStaleMonths.join(', ')+' -- that contract didn\'t return a usable quote this fetch, so the most recent successful value is shown instead of nothing.</div>':'')
+        +(probRows?'<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--surface3)"><div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-bottom:2px">Meeting-by-meeting odds:</div>'+probRows+'</div>':'')
         +'</div>';
     })()}
     <div class="card">
@@ -351,6 +661,52 @@ function toggleTBillSpan(span){
   if(data)_drawTBillChart(data.tbill3m,data.tbill5y,data.tbill10y,span);
 }
 
+// Carries forward a previously-successful contract value for any month
+// that failed THIS SPECIFIC fetch -- an implied Fed Funds rate barely
+// moves day to day, so a slightly-stale prior value is far more useful
+// than nothing. But only up to a point: a carried-forward contract stays
+// usable for at most MAX_STALE_MS before it's dropped entirely (treated
+// as a genuine fetch failure) rather than silently continuing to
+// influence FOMC probabilities from an arbitrarily old quote.
+// Preserves the ORIGINAL staleness timestamp across repeated carry-
+// forwards, rather than re-stamping it to "now" every time this runs
+// (which happens on every partial-success save, stale months included --
+// without this, a contract stuck for weeks would still show a "just
+// now"-ish staleAsOf purely because OTHER months kept succeeding and
+// re-triggering a cache write, which would make any maximum-age check
+// meaningless).
+const FED_FUTURES_MAX_STALE_MS=5*86400000; // ~5 calendar days -- a long weekend/holiday plus a few stale days, roughly "a few trading days" without needing a full trading calendar
+function _carryForwardStaleFedFutures(fedFutures,fedFuturesFailedMonths,prevCache,mktTsEpoch){
+  if(!fedFuturesFailedMonths.length)return{fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths:[]};
+  const prevContracts=prevCache?.data||[];
+  const stillMissing=[],fedFuturesStaleMonths=[];
+  fedFuturesFailedMonths.forEach(monthLabel=>{
+    const prev=prevContracts.find(c=>c.month===monthLabel);
+    if(prev){
+      const staleAsOfEpoch=prev.stale?(prev.staleAsOfEpoch||prevCache.tsEpoch||null):(prevCache.tsEpoch||null);
+      const staleAsOf=prev.stale?(prev.staleAsOf||prevCache.ts||null):(prevCache.ts||null);
+      const ageMs=staleAsOfEpoch!=null?(mktTsEpoch-staleAsOfEpoch):null;
+      if(ageMs!=null&&ageMs>FED_FUTURES_MAX_STALE_MS){
+        stillMissing.push(monthLabel); // too old to trust any further -- treat exactly like a genuine fetch failure
+      }else{
+        fedFutures.push({...prev,stale:true,staleAsOf,staleAsOfEpoch});
+        fedFuturesStaleMonths.push(monthLabel);
+      }
+    }
+    else stillMissing.push(monthLabel);
+  });
+  if(fedFuturesStaleMonths.length){
+    // Re-sort chronologically -- the carried-over entries were just
+    // appended, not inserted in order. Parses "Aug 2026" style labels
+    // rather than sorting the strings directly, since e.g. "Feb 2027" <
+    // "Jan 2027" alphabetically despite coming after it in time.
+    const _monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const _toDate=lbl=>{const[m,y]=lbl.split(' ');return new Date(parseInt(y),_monthNames.indexOf(m),1);};
+    fedFutures.sort((a,b)=>_toDate(a.month)-_toDate(b.month));
+  }
+  return{fedFutures,fedFuturesFailedMonths:stillMissing,fedFuturesStaleMonths};
+}
+
 async function loadMarketTab(){
   if(offlineMode){await restoreMarketFromCache();return;}
   const el=document.getElementById('market-content');
@@ -419,40 +775,31 @@ async function loadMarketTab(){
         fedFutures=fedResult.contracts;
         fedFuturesFailedMonths=fedResult.failedMonths||[];
         // Carry forward a previously-successful value for any month that
-        // failed THIS SPECIFIC fetch -- an implied Fed Funds rate barely
-        // moves day to day, so a slightly-stale prior value is far more
-        // useful than nothing. Previously, a partial fetch failure (some
-        // months fine, one or two not) silently dropped those months
-        // entirely, even though a perfectly good recent value was still
-        // sitting in cache -- the fallback below only ever covered a
-        // TOTAL fetch failure, never a per-month gap within an otherwise
-        // successful one. Same seed-from-previous-cache principle already
-        // used elsewhere in this app (quoteSummary fields, ticker names).
-        if(fedFuturesFailedMonths.length){
-          const prevCache=S.get('fed_futures');
-          const prevContracts=prevCache?.data||[];
-          const stillMissing=[];
-          fedFuturesFailedMonths.forEach(monthLabel=>{
-            const prev=prevContracts.find(c=>c.month===monthLabel);
-            if(prev){fedFutures.push({...prev,stale:true,staleAsOf:prevCache.ts||null});fedFuturesStaleMonths.push(monthLabel);}
-            else stillMissing.push(monthLabel);
-          });
-          if(fedFuturesStaleMonths.length){
-            // Re-sort chronologically -- the carried-over entries were
-            // just appended, not inserted in order. Parses "Aug 2026"
-            // style labels rather than sorting the strings directly,
-            // since e.g. "Feb 2027" < "Jan 2027" alphabetically despite
-            // coming after it in time.
-            const _monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-            const _toDate=lbl=>{const[m,y]=lbl.split(' ');return new Date(parseInt(y),_monthNames.indexOf(m),1);};
-            fedFutures.sort((a,b)=>_toDate(a.month)-_toDate(b.month));
-          }
-          fedFuturesFailedMonths=stillMissing; // only genuinely never-seen months remain "failed"
-        }
+        // failed THIS SPECIFIC fetch, up to a maximum usable age -- see
+        // _carryForwardStaleFedFutures above. Previously, a partial fetch
+        // failure (some months fine, one or two not) silently dropped
+        // those months entirely, even though a perfectly good recent
+        // value was still sitting in cache -- the fallback below only
+        // ever covered a TOTAL fetch failure, never a per-month gap
+        // within an otherwise successful one. Same seed-from-previous-
+        // cache principle already used elsewhere in this app
+        // (quoteSummary fields, ticker names).
+        ({fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths}=_carryForwardStaleFedFutures(fedFutures,fedFuturesFailedMonths,S.get('fed_futures'),mktTsEpoch));
         S.set('fed_futures',{data:fedFutures,failedMonths:fedFuturesFailedMonths,ts:mktTs,tsEpoch:mktTsEpoch});
       }
     }catch{}
     if(!fedFutures){const cf=S.get('fed_futures');if(cf){fedFutures=cf.data;fedFuturesFailedMonths=cf.failedMonths||[];}}
+    // NY Fed EFFR history, for authoritative resolution of past FOMC
+    // meetings in _computeFedMeetingProbabilities (called at render time,
+    // below/on cache-restore). Independent of the futures fetch above -- a
+    // failure here just means past-meeting resolution falls back to the
+    // futures-implied method, same as every build before this one.
+    let effrRows=null;
+    try{
+      effrRows=await _mktTimeout(fetchEffrHistory(_earliestEffrStartNeeded(fedFutures)),10000,'NY Fed EFFR');
+      if(effrRows&&effrRows.length)S.set('fomc_effr_cache',{rows:effrRows,ts:mktTs,tsEpoch:mktTsEpoch});
+    }catch{}
+    if(!effrRows||!effrRows.length){const ce=S.get('fomc_effr_cache');if(ce)effrRows=ce.rows||[];}
     // Treasury yields via Yahoo Finance (^IRX/^FVX/^TNX), routed through
     // the Worker. Previously this comment referenced Treasury FiscalData --
     // that was abandoned for SSL failures on Cloudflare Workers; Yahoo has
@@ -471,7 +818,7 @@ async function loadMarketTab(){
     let marketNews=await _fetchMarketNews();
 
     const derived=_computeMarketDerivedValues(sp500,nasdaq,spLivePrice,spPrevClose,nqLivePrice,nqPrevClose,tbill3m,tbill5y,tbill10y);
-    _renderMarketContent(el,{ts:mktTs,isLive,tsEpoch:mktTsEpoch,fredTs,fredTsEpoch,fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths,tbill3m,tbill5y,tbill10y,marketNews,derived});
+    _renderMarketContent(el,{ts:mktTs,isLive,tsEpoch:mktTsEpoch,fredTs,fredTsEpoch,fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths,effrRows,tbill3m,tbill5y,tbill10y,marketNews,derived});
 
     S.set('market_ts',{ts:nowPT(),tsEpoch:Date.now()});
   }catch(err){el.innerHTML=`<div class="card"><div style="font-family:var(--mono);font-size:12px;color:var(--red)">Error: ${err.message}</div></div>`;}
@@ -480,14 +827,11 @@ async function loadMarketTab(){
 // ── Cache age helper (minutes) ──────────────────────────────────────────────
 // Returns how many minutes ago a stored timestamp string was, or Infinity if
 // the timestamp is absent / unparseable.
-function _mktCacheAgeMins(tsStr){
-  if(!tsStr)return Infinity;
-  try{
-    const clean=(typeof tsStr==='object'&&tsStr.ts)?tsStr.ts:tsStr;
-    const d=new Date(String(clean).replace(/ PT$| UTC$| local$/,'').trim());
-    if(isNaN(d.getTime()))return Infinity;
-    return(Date.now()-d.getTime())/60000;
-  }catch{return Infinity;}
+function _mktCacheAgeMins(rec){
+  // Pass the whole cache record ({ts,tsEpoch}) or a legacy bare ts string --
+  // tsEpoch is used when present (see _recEpoch in helpers.js).
+  const e=_recEpoch(rec);
+  return e==null?Infinity:(Date.now()-e)/60000;
 }
 
 // Fetches general market news and updates the cache. Used both by the full
@@ -533,12 +877,12 @@ async function restoreMarketFromCache(){
   //   offline (any cache age)     → loadMarketTab() handles offline path itself
 
   const mktTs=S.get('market_ts');
-  const dataAgeMins=_mktCacheAgeMins(mktTs?.ts||mktTs);
+  const dataAgeMins=_mktCacheAgeMins(mktTs);
   const dataTtlMins=_isMarketActiveWindow()?5:Infinity;
 
   if(dataAgeMins>=0&&dataAgeMins<dataTtlMins&&navigator.onLine){
     const cnews=S.get('market_news');
-    const newsAgeMins=_mktCacheAgeMins(cnews?.ts);
+    const newsAgeMins=_mktCacheAgeMins(cnews);
     if(!(newsAgeMins>=0&&newsAgeMins<MARKET_NEWS_FRESH_MINS)){
       await _fetchMarketNews();
     }
@@ -594,6 +938,9 @@ function _renderMarketFromCache(){
   // need to persist the same information twice.
   const fedFuturesStaleMonths=(fedFutures||[]).filter(c=>c.stale).map(c=>c.month);
 
+  const ce=S.get('fomc_effr_cache');
+  const effrRows=ce?.rows||[];
+
   const cd=S.get('tbills_cache');
   const tbill3m=cd?.tbill3m||[];
   const tbill5y=cd?.tbill5y||[];
@@ -605,7 +952,7 @@ function _renderMarketFromCache(){
   const marketNews=cnews?.items||[];
 
   const derived=_computeMarketDerivedValues(sp500,nasdaq,spLivePrice,spPrevClose,nqLivePrice,nqPrevClose,tbill3m,tbill5y,tbill10y);
-  _renderMarketContent(el,{ts:cachedTs,isLive:false,tsEpoch:mktTsEpoch,fredTs,fredTsEpoch,fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths,tbill3m,tbill5y,tbill10y,marketNews,derived});
+  _renderMarketContent(el,{ts:cachedTs,isLive:false,tsEpoch:mktTsEpoch,fredTs,fredTsEpoch,fedFutures,fedFuturesFailedMonths,fedFuturesStaleMonths,effrRows,tbill3m,tbill5y,tbill10y,marketNews,derived});
 
   setTimeout(refreshTsChipAges,200);
 }

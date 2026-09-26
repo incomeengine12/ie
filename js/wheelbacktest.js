@@ -6,9 +6,13 @@
 // historical options-chain data. This is a real, documented simplification
 // (see the "Premium source" label always shown alongside results) with a
 // few known biases:
-//   - Realized vol typically understates implied vol (the volatility risk
-//     premium), so simulated premiums likely run somewhat LOW versus what
-//     was actually available historically -- a conservative bias.
+//   - Realized vol runs below implied vol (the volatility risk premium) on
+//     average, so simulated premiums often skew somewhat low versus what
+//     was actually available historically -- but this isn't universal.
+//     After a sharp move, trailing realized vol can exceed contemporaneous
+//     implied vol; skew and regime vary by ticker. Direction and size of
+//     the error aren't consistent enough to call this a reliably
+//     conservative bias.
 //   - No bid-ask spread, no volatility skew beyond the estimated term
 //     structure adjustment below, no early assignment around dividends
 //     (all explicitly out of scope for this version).
@@ -36,7 +40,131 @@
 // same number the results get compared against, rather than two
 // independently-chosen values that happened to both be "12" by
 // coincidence.
+// Cash-held (not reinvested) dividend sum for the buy-and-hold comparison
+// -- consistent with the wheel side's own simple, non-compounded premium
+// accounting (cumPremium is never treated as capital that buys more
+// contracts), so both sides of the comparison use the same convention. At
+// the ~1-year window lengths this backtest uses, reinvestment would barely
+// move the number anyway -- the gap only compounds meaningfully over much
+// longer horizons than these windows cover.
+function _sumDividendsInRange(dividends,startDate,endDate){
+  if(!dividends||!dividends.length)return 0;
+  return dividends.reduce((s,d)=>{
+    if(!d?.date||d.amount==null)return s;
+    const dDate=new Date(d.date+'T12:00:00Z');
+    return(dDate>=startDate&&dDate<=endDate)?s+d.amount:s;
+  },0);
+}
+
+// Trailing-twelve-month dividend yield as of a specific historical date --
+// the dividend-yield input (q) for Black-Scholes-Merton pricing. Reuses
+// _sumDividendsInRange (already tested for the dividend-crediting work)
+// rather than a new date-range scan. Deliberately trailing, not forward:
+// using only what was already paid as of asOfDate avoids any look-ahead,
+// matching the same discipline already used for the historical rate and
+// term-structure calculations. Returns 0 (no adjustment) for a ticker with
+// no dividend history at all -- the common case for most wheel candidates,
+// where this has no effect either way.
+function _dividendYieldAsOf(dividends,asOfDate,spotAtAsOf){
+  if(!dividends||!dividends.length||!spotAtAsOf||spotAtAsOf<=0)return 0;
+  const oneYearBefore=new Date(asOfDate.getTime()-365*86400000);
+  const ttmDividends=_sumDividendsInRange(dividends,oneYearBefore,asOfDate);
+  return ttmDividends>0?ttmDividends/spotAtAsOf:0;
+}
+
+// Largest peak-to-trough decline within one window's own cumulative-%
+// curve (trades[i].cumulativePct, already time-weighted). Deliberately
+// NOT a cross-window figure -- the windows this backtest produces overlap
+// and aren't independent, so stitching them into one continuous curve
+// would be more misleading than informative. Returns 0 for a curve that
+// never dips below its own running peak.
+function _maxDrawdownPct(trades){
+  // Starts at 0 -- the window's own true starting point, before any trades
+  // have happened -- not -Infinity. Starting from -Infinity meant the
+  // FIRST observed cumulativePct silently became the new "peak" regardless
+  // of its value, so a window whose very first cycle was itself a big loss
+  // reported zero drawdown (nothing to have fallen FROM). Starting at 0
+  // means an immediate loss correctly registers as a real decline from the
+  // window's actual beginning.
+  let peak=0,maxDD=0;
+  for(const t of trades){
+    if(t.cumulativePct==null)continue;
+    if(t.cumulativePct>peak)peak=t.cumulativePct;
+    const dd=peak-t.cumulativePct;
+    if(dd>maxDD)maxDD=dd;
+  }
+  return maxDD;
+}
+
+// Standard downside deviation -- root-mean-square of the shortfall below
+// zero, across a set of returns (e.g. the same per-window annualized
+// returns already computed for the worst/median/best figures). Only a
+// below-zero return contributes to the sum; a break-even or positive
+// window contributes zero, per the standard definition -- this measures
+// downside risk specifically, not overall variance around the mean the
+// way a plain standard deviation would.
+function _downsideDeviationPct(returns){
+  if(!returns.length)return 0;
+  const sumSq=returns.reduce((s,v)=>s+Math.pow(Math.min(0,v),2),0);
+  return Math.sqrt(sumSq/returns.length);
+}
+
 const WHEELBT_DEFAULT_TARGET_APY=12; // matches _calcIncome's own fallback default
+
+// Finds the most recent ^IRX close at-or-before a given date (epoch ms),
+// via binary search over its ascending daily timestamps -- called once per
+// trading day per capital segment across a full backtest run, so O(log n)
+// matters here versus a linear scan. Returns a decimal rate (^IRX quotes
+// as a percent, e.g. 5.25, so /100), or null if no data covers that date
+// (before the cache existed, or predates ^IRX's own fetched range).
+function _irxRateAsOf(irxHist2y,targetEpochMs){
+  if(!irxHist2y?.timestamps?.length)return null;
+  const ts=irxHist2y.timestamps,closes=irxHist2y.closes;
+  let lo=0,hi=ts.length-1,ans=-1;
+  while(lo<=hi){
+    const mid=(lo+hi)>>1;
+    if(ts[mid]*1000<=targetEpochMs){ans=mid;lo=mid+1;}
+    else hi=mid-1;
+  }
+  if(ans===-1)return null;
+  const v=closes[ans];
+  return v!=null&&v>0?v/100:null;
+}
+
+// Time-weighted average capital deployed across a list of regime segments
+// (see _simulateWheelWindow) -- 'cash' segments contribute a constant
+// dollar amount for their span (strike-based collateral, full cash-secured,
+// no margin reduction); 'shares' segments contribute the day-by-day marked
+// value of the shares actually held, since that moves with the stock price
+// throughout the holding period rather than staying fixed at whatever
+// price prevailed when the shares were first acquired.
+function _timeWeightedCapitalBase(segments,closes){
+  let totalDollarDays=0,totalDays=0;
+  for(const seg of segments){
+    const days=seg.endIdx-seg.startIdx+1;
+    if(days<=0)continue;
+    if(seg.type==='cash'){
+      totalDollarDays+=seg.capital*days;
+    }else{ // 'shares'
+      for(let i=seg.startIdx;i<=seg.endIdx;i++){
+        const px=closes[i];
+        if(px!=null)totalDollarDays+=px; // per-share, matching cumPremium/realizedShareGainLoss's own convention -- NOT per-contract (*100), which would create a unit mismatch against the P&L side of the ratio
+      }
+    }
+    totalDays+=days;
+  }
+  return totalDays>0?totalDollarDays/totalDays:null;
+}
+
+// Correct median for an array already sorted ascending -- averages the two
+// center elements when the count is even, rather than picking one side of
+// them (a small but real upward bias on evenly-sized samples otherwise).
+function _medianOfSorted(sorted){
+  const n=sorted.length;
+  if(!n)return null;
+  const mid=Math.floor(n/2);
+  return n%2===0?(sorted[mid-1]+sorted[mid])/2:sorted[mid];
+}
 
 // ── Real monthly-expiration calendar mechanics ──────────────────────────
 // Earlier version used a fixed trading-day offset (e.g. "45 days later")
@@ -111,12 +239,27 @@ function _wheelBacktestDateStr(d,includeYear){
   return parsed.toLocaleDateString('en-US',includeYear?{month:'short',day:'numeric',year:'numeric'}:{month:'short',day:'numeric'});
 }
 
+// Comparable calendar-date key (LOCAL year/month/day, ignoring time-of-day
+// entirely) -- used instead of comparing raw Date instants below. A target
+// date built via _thirdFriday()/new Date(year,month,day) lands at LOCAL
+// MIDNIGHT, while a real Yahoo candle timestamp lands hours later (roughly
+// market open) -- comparing those as raw instants means a Friday candle's
+// timestamp is always AFTER that same Friday's midnight-constructed target,
+// so "at or before Friday" silently rolled back and resolved to Thursday's
+// candle every single time, for every monthly expiration. Comparing by
+// calendar date alone makes the specific time-of-day each side happens to
+// carry irrelevant, which is the actual question being asked ("which
+// trading day is this") rather than a coincidental byproduct of it.
+function _calendarDateKey(d){
+  return d.getFullYear()*10000+d.getMonth()*100+d.getDate();
+}
 function _tradingDayIndexAtOrBefore(timestamps,targetDate){
+  const targetKey=_calendarDateKey(targetDate);
   let lo=0,hi=timestamps.length-1,result=null;
   while(lo<=hi){
     const mid=(lo+hi)>>1;
-    const midDate=_parseHist2yDate(timestamps[mid]);
-    if(midDate<=targetDate){result=mid;lo=mid+1;}else{hi=mid-1;}
+    const midKey=_calendarDateKey(_parseHist2yDate(timestamps[mid]));
+    if(midKey<=targetKey){result=mid;lo=mid+1;}else{hi=mid-1;}
   }
   return result;
 }
@@ -125,11 +268,12 @@ function _tradingDayIndexAtOrBefore(timestamps,targetDate){
 // date. Used below to find "the trading day you'd actually re-enter on,
 // right after a real expiration."
 function _tradingDayIndexAtOrAfter(timestamps,targetDate){
+  const targetKey=_calendarDateKey(targetDate);
   let lo=0,hi=timestamps.length-1,result=null;
   while(lo<=hi){
     const mid=(lo+hi)>>1;
-    const midDate=_parseHist2yDate(timestamps[mid]);
-    if(midDate>=targetDate){result=mid;hi=mid-1;}else{lo=mid+1;}
+    const midKey=_calendarDateKey(_parseHist2yDate(timestamps[mid]));
+    if(midKey>=targetKey){result=mid;hi=mid-1;}else{lo=mid+1;}
   }
   return result;
 }
@@ -203,6 +347,37 @@ function _realisticStrikeIncrement(spot){
   return spot<=25?2.5:spot<=200?5:10;
 }
 
+// Infers a ticker's real strike LADDER from its currently cached options
+// chains (pooling every cached expiration, since any single one might be
+// missing a strike or two) -- returned as a sorted array of actual
+// strikes, so the caller can select directly from real strikes rather
+// than computing a synthetic increment and doing grid arithmetic on it.
+// Direct selection is the more robust of the two approaches an increment
+// alone allows: a single irregular or adjusted strike could otherwise
+// dominate a MINIMUM-gap increment (or skew a modal one), and grid math
+// built on top of even a correctly-inferred increment can still land on
+// a price that was never actually a listed strike. Selecting from the
+// real, observed strikes can't have either problem.
+// Necessarily approximate (today's chain, applied to a simulated trade
+// from possibly years in the past -- see the Guide) and returns null
+// (meaning: fall back to the generic tier rule) whenever there's too
+// little cached data to trust it.
+const _MIN_STRIKES_FOR_INCREMENT_INFERENCE=6;
+function _inferStrikeLadder(ticker){
+  if(!ticker)return null;
+  try{
+    const expEntries=_cachedExpEntries(ticker);
+    if(!expEntries.length)return null;
+    const allStrikes=new Set();
+    expEntries.forEach(({date})=>{
+      _getStrikesForExpiration(ticker,date).forEach(s=>{if(s>0)allStrikes.add(s);});
+      _getCallStrikesForExpiration(ticker,date).forEach(s=>{if(s>0)allStrikes.add(s);});
+    });
+    const sorted=[...allStrikes].sort((a,b)=>a-b);
+    return sorted.length>=_MIN_STRIKES_FOR_INCREMENT_INFERENCE?sorted:null;
+  }catch{return null;}
+}
+
 // Snaps toward the money (never away from it) -- yield is monotonic in
 // strike, so rounding this direction guarantees the snapped strike still
 // clears the floor whenever the continuous boundary did (never rounds to
@@ -210,12 +385,49 @@ function _realisticStrikeIncrement(spot){
 // itself (can happen when spot sits very close to a grid line -- not
 // realistic with real market prices to the degree seen in clean
 // synthetic test data, but the underlying case is real near tier
-// boundaries), pushes one more full increment out: a strike
-// indistinguishable from spot isn't a genuine OTM position, and no real
-// options chain would treat it as meaningfully different from ATM.
-// Returns null if the increment is coarse enough that no valid OTM
-// strike exists at all in this direction.
-function _snapStrikeToRealistic(rawStrike,spot,optionType){
+// boundaries), pushes one step further out: a strike indistinguishable
+// from spot isn't a genuine OTM position, and no real options chain
+// would treat it as meaningfully different from ATM.
+// Returns null if no valid OTM strike exists at all in this direction.
+//
+// `ladder` (optional): a real strike ladder from _inferStrikeLadder,
+// computed ONCE by the caller (see _simulateWheelWindow) and passed down
+// -- selects directly from these actual strikes when the raw theoretical
+// strike falls within their range. Falls back to the generic price-tier
+// increment (computed fresh, not from the ladder) when there's no
+// trustworthy ladder, or the raw strike falls outside what it covers.
+function _snapStrikeToRealistic(rawStrike,spot,optionType,ladder){
+  // A ladder only has real information about the price region it
+  // actually spans. If rawStrike falls entirely outside that range (a
+  // very cheap or very expensive theoretical strike relative to what's
+  // cached), picking "the nearest available entry anyway" would silently
+  // return something arbitrarily far from the real target -- not a
+  // meaningful snap, just whatever happened to be cached. Fall through
+  // to the generic tier rule in that case instead of guessing beyond
+  // what the real data actually covers.
+  if(ladder&&ladder.length&&rawStrike>=ladder[0]&&rawStrike<=ladder[ladder.length-1]){
+    let candidate=null,candidateIdx=-1;
+    if(optionType==='put'){
+      for(let i=0;i<ladder.length;i++){if(ladder[i]>=rawStrike){candidate=ladder[i];candidateIdx=i;break;}}
+    }else{
+      for(let i=ladder.length-1;i>=0;i--){if(ladder[i]<=rawStrike){candidate=ladder[i];candidateIdx=i;break;}}
+    }
+    if(candidate!=null){
+      const EPS=Math.max(candidate,spot)*0.001;
+      const tooCloseToSpot=optionType==='put'?candidate>=spot-EPS:candidate<=spot+EPS;
+      if(tooCloseToSpot){
+        // Push one step further out using the ADJACENT REAL STRIKE, not
+        // an arithmetic offset -- stays on the real ladder either way.
+        const nextIdx=optionType==='put'?candidateIdx-1:candidateIdx+1;
+        candidate=(nextIdx>=0&&nextIdx<ladder.length)?ladder[nextIdx]:null;
+      }
+      if(candidate!=null){
+        const stillOTM=optionType==='put'?candidate<spot:candidate>spot;
+        if(stillOTM)return candidate;
+      }
+      return null; // a real ladder covered this range and conclusively had no valid OTM strike here
+    }
+  }
   const increment=_realisticStrikeIncrement(spot);
   let snapped=optionType==='put'
     ?Math.ceil(rawStrike/increment)*increment
@@ -227,7 +439,7 @@ function _snapStrikeToRealistic(rawStrike,spot,optionType){
   return stillOTM?snapped:null;
 }
 
-function _simulateOneCycle(hist2y,entryIdx,monthsOut,targetFloorPct,optionType,r,termSlope,earningsAvoidDates){
+function _simulateOneCycle(hist2y,entryIdx,monthsOut,targetFloorPct,optionType,r,termSlope,earningsAvoidDates,q,ladder){
   const closes=hist2y.closes,timestamps=hist2y.timestamps;
   const n=closes.length;
   const S0=closes[entryIdx];
@@ -277,11 +489,11 @@ function _simulateOneCycle(hist2y,entryIdx,monthsOut,targetFloorPct,optionType,r
   // and pricing should reflect the real duration being simulated.
   const T=(exitDate-entryDate)/(365*86400000);
   if(T<=0)return null;
-  const K_raw=_solveStrikeForYieldFloor(S0,T,r,sigma,targetFloorPct,optionType);
+  const K_raw=_solveStrikeForYieldFloor(S0,T,r,sigma,targetFloorPct,optionType,q);
   if(K_raw==null||!isFinite(K_raw))return null; // floor not reachable at this DTE -- caller tries a different DTE or waits
-  const K=_snapStrikeToRealistic(K_raw,S0,optionType);
+  const K=_snapStrikeToRealistic(K_raw,S0,optionType,ladder);
   if(K==null)return null; // increment too coarse at this price level -- would cross the money, not a valid OTM strike
-  const premium=optionType==='put'?_bsPutPrice(S0,K,T,r,sigma):_bsCallPrice(S0,K,T,r,sigma);
+  const premium=optionType==='put'?_bsPutPrice(S0,K,T,r,sigma,q):_bsCallPrice(S0,K,T,r,sigma,q);
   if(!isFinite(premium)||premium<0)return null;
   // Snapping (especially the too-close-to-spot push-out above) can move
   // the strike further from the money than the continuous boundary was --
@@ -290,14 +502,15 @@ function _simulateOneCycle(hist2y,entryIdx,monthsOut,targetFloorPct,optionType,r
   // specific entry/DTE genuinely can't be done with a real, valid strike
   // -- the caller's existing escalation/waiting logic handles this
   // exactly like any other infeasible attempt.
-  const actualYield=_annualizedYieldPct(premium,S0,T);
+  const actualYield=_annualizedYieldPct(premium,optionType==='put'?K:S0,T); // same strike-vs-spot convention as _solveStrikeForYieldFloor -- see its comment
   if(actualYield<targetFloorPct-0.01)return null;
 
   const priceAtExit=closes[exitIdx];
   if(priceAtExit==null)return null;
   const assigned=optionType==='put'?(priceAtExit<K):(priceAtExit>K);
 
-  return{entryIdx,exitIdx,optionType,strike:K,premium,spotAtEntry:S0,priceAtExit,assigned,monthsUsed:monthsOut};
+  // pricingSigma/R/Q: the exact (term-adjusted) inputs this premium was priced with -- kept so the open option can be re-marked day by day for the daily drawdown (see _simulateWheelWindow)
+  return{entryIdx,exitIdx,optionType,strike:K,premium,spotAtEntry:S0,priceAtExit,assigned,monthsUsed:monthsOut,pricingSigma:sigma,pricingR:r,pricingQ:q||0};
 }
 
 // Given a candidate entry day and a preferred starting DTE, finds the
@@ -329,19 +542,50 @@ function _simulateOneCycle(hist2y,entryIdx,monthsOut,targetFloorPct,optionType,r
 // Clamped to a modest range so a thin/noisy sample can't produce an
 // extreme adjustment; returns 1.0 (flat, no adjustment) if there isn't
 // enough history yet to estimate anything.
-function _estimateTermStructureSlope(hist2y){
+// asOfIdx bounds this to data available at-or-before a given point in the
+// 2-year history -- required for use inside a backtest simulation loop,
+// where using the FULL 2-year array regardless of a cycle's own simulated
+// entry date would be look-ahead bias (a cycle "trading" a year ago would
+// be informed by realized vol that, from its own vantage point, hasn't
+// happened yet). Defaults to the full array when omitted, which is correct
+// for a live (non-backtest) caller reasoning about "today" -- there is no
+// look-ahead risk when "now" genuinely is the most recent data point.
+// Pure given (hist2y, asOfIdx) -- the aggregate backtest runs MANY
+// overlapping windows for the same ticker (each 21 trading days apart,
+// often spanning 200+ days), and _findFloorClearingCycle (build 479) can
+// call this for several candidate days per cycle on top of that. Measured
+// on a realistic multi-window run: ~63% of calls repeat an asOfIdx already
+// computed for that ticker. _termStructureSlopeCache, a WeakMap keyed on
+// the hist2y object itself, avoids recomputing those -- each ticker's own
+// hist2y is a distinct object (fetched once per ticker and reused across
+// all of that ticker's windows, see _computeWheelBacktest/Aggregate), so
+// this naturally scopes per ticker with nothing to clear between runs and
+// nothing to leak (WeakMap entries drop once hist2y itself is no longer
+// referenced elsewhere).
+const _termStructureSlopeCache=new WeakMap();
+function _estimateTermStructureSlope(hist2y,asOfIdx){
+  let cache=_termStructureSlopeCache.get(hist2y);
+  if(!cache)_termStructureSlopeCache.set(hist2y,cache=new Map());
+  const key=asOfIdx==null?-1:asOfIdx; // asOfIdx==null is its own distinct, valid cache key (means "use the full series")
+  if(cache.has(key))return cache.get(key);
   const closes=hist2y.closes;
-  const n=closes.length;
+  const n=asOfIdx!=null?Math.min(asOfIdx+1,closes.length):closes.length;
   const ratios=[];
   for(let refIdx=63;refIdx+63<=n-1;refIdx+=21){
     const vol21=_realizedVolAsOf(closes,refIdx+21,21); // realized vol over the 21 trading days after refIdx
     const vol63=_realizedVolAsOf(closes,refIdx+63,63); // realized vol over the 63 trading days after refIdx
     if(vol21!=null&&vol21>0&&vol63!=null&&vol63>0)ratios.push(vol63/vol21);
   }
-  if(!ratios.length)return 1.0;
-  const avgRatio=ratios.reduce((s,v)=>s+v,0)/ratios.length;
-  const CLAMP_MIN=0.7,CLAMP_MAX=1.4;
-  return Math.max(CLAMP_MIN,Math.min(CLAMP_MAX,avgRatio));
+  let result;
+  if(!ratios.length){
+    result=1.0;
+  }else{
+    const avgRatio=ratios.reduce((s,v)=>s+v,0)/ratios.length;
+    const CLAMP_MIN=0.7,CLAMP_MAX=1.4;
+    result=Math.max(CLAMP_MIN,Math.min(CLAMP_MAX,avgRatio));
+  }
+  cache.set(key,result);
+  return result;
 }
 
 // Orders candidate DTEs (1..maxMonthsOut) by closeness to the preferred
@@ -361,13 +605,28 @@ function _monthsOutSearchOrder(baseMonthsOut,maxMonthsOut){
   return all;
 }
 
-function _findFloorClearingCycle(hist2y,candidateEntryIdx,baseMonthsOut,targetFloorPct,optionType,r,maxMonthsOut,termSlope,earningsAvoidDates){
+// r/q/termSlope used to be computed ONCE by the caller, at candidateEntryIdx,
+// and reused unchanged as this function walks forward through later trading
+// days looking for a floor-clearing entry. That's fine when the very first
+// day tried clears (the common case), but wrong when it doesn't: the
+// eventually-chosen entry day's price and volatility were always correct
+// (_simulateOneCycle reads spot/vol at its own idx), while the rate,
+// dividend yield and term-structure slope kept using the SEARCH's starting
+// day instead of the day actually traded. Now recomputed fresh for every
+// idx the search actually visits, same as _simulateWheelWindow's main loop
+// already does for the first day of each cycle.
+function _findFloorClearingCycle(hist2y,candidateEntryIdx,baseMonthsOut,targetFloorPct,optionType,rFallback,maxMonthsOut,earningsAvoidDates,dividends,irxHist2y,ladder){
   const n=hist2y.closes.length;
   const searchOrder=_monthsOutSearchOrder(baseMonthsOut,maxMonthsOut);
   let idx=candidateEntryIdx;
   while(idx<n){
+    const dateMs=hist2y.timestamps?.[idx]!=null?hist2y.timestamps[idx]*1000:null;
+    const historicalR=dateMs!=null&&irxHist2y?_irxRateAsOf(irxHist2y,dateMs):null;
+    const r=historicalR!=null?historicalR:rFallback;
+    const q=dateMs!=null?_dividendYieldAsOf(dividends,new Date(dateMs),hist2y.closes[idx]):0;
+    const termSlope=getTermStructureEnabled()?_estimateTermStructureSlope(hist2y,idx):null;
     for(const m of searchOrder){
-      const cyc=_simulateOneCycle(hist2y,idx,m,targetFloorPct,optionType,r,termSlope,earningsAvoidDates);
+      const cyc=_simulateOneCycle(hist2y,idx,m,targetFloorPct,optionType,r,termSlope,earningsAvoidDates,q,ladder);
       if(cyc)return cyc;
     }
     idx+=1; // no DTE (shorter or longer) cleared the floor on this entry day, or all spanned an earnings date -- wait for the next trading day
@@ -381,7 +640,7 @@ function _findFloorClearingCycle(hist2y,candidateEntryIdx,baseMonthsOut,targetFl
 // window's ~1 year is used up or the available price history runs out.
 const WHEELBT_MAX_MONTHS_OUT=3; // matches the app's existing 3-expiry data-fetch cap elsewhere
 
-function _simulateWheelWindow(hist2y,startIdx,monthsOut,targetFloorPct,r,termSlope,maxTradingDays,earningsDates,earningsAvoidTypes){
+function _simulateWheelWindow(hist2y,startIdx,monthsOut,targetFloorPct,r,maxTradingDays,earningsDates,earningsAvoidTypes,dividends,irxHist2y,opts,ladder){
   const closes=hist2y.closes;
   const startPrice=closes[startIdx];
   if(startPrice==null||startPrice<=0)return null;
@@ -395,40 +654,154 @@ function _simulateWheelWindow(hist2y,startIdx,monthsOut,targetFloorPct,r,termSlo
   const tradingDaysInYear=maxTradingDays||252; // callers omit this for the standard ~1-year window; Full History passes Infinity
   const hasEarningsDates=earningsDates&&earningsDates.length>0;
 
+  // Time-weighted capital ledger -- see _timeWeightedCapitalBase. 'cash'
+  // segments (full cash-secured, no margin reduction -- matches
+  // _posNotional in the Income tab and the strike-based yield fix already
+  // shipped) cover every stretch between a call-away (or window start) and
+  // the next assignment, including any days spent searching for a
+  // floor-clearing put to sell. 'shares' segments cover every stretch a
+  // position is actually held, from assignment through eventual
+  // call-away, INCLUDING any days spent searching for a covered call to
+  // write against those same already-held shares -- the shares don't stop
+  // being capital just because a call hasn't been sold against them yet.
+  const segments=[];
+  let regimeStartIdx=startIdx;
+  let cashInterest=0;
+  let shareDividends=0; // dividends actually received during a CLOSED (assignment-ended) shares-held stretch -- see unrealizedShareDividends below for a still-open stretch at window end
+
+  const _accrueCashInterest=(fromIdx,toIdx,capital)=>{
+    if(!irxHist2y)return;
+    for(let i=fromIdx;i<=toIdx;i++){
+      const dateMs=hist2y.timestamps?.[i]!=null?hist2y.timestamps[i]*1000:null;
+      if(dateMs==null)continue;
+      const rate=_irxRateAsOf(irxHist2y,dateMs);
+      if(rate==null)continue;
+      // Weight by the actual CALENDAR-day gap to the next trading day (in
+      // the full history, not bounded to this segment) -- a trading day
+      // followed by a weekend or holiday accrues interest for those
+      // non-trading days too, not just itself. Without this, a full year
+      // of cash-holding only ever executes ~252 loop iterations (one per
+      // trading day) and undercounts interest by roughly 252/365. Summed
+      // across consecutive trading days, this telescopes to exactly the
+      // real calendar-day span, no double-counting or gaps.
+      const nextDateMs=hist2y.timestamps?.[i+1]!=null?hist2y.timestamps[i+1]*1000:null;
+      const daysWeight=nextDateMs!=null?Math.max(1,Math.round((nextDateMs-dateMs)/86400000)):1;
+      cashInterest+=capital*rate/365*daysWeight;
+    }
+  };
+  // Dividends received while actually holding shares -- distinct from the
+  // buy-and-hold comparison's own dividend credit below, and NOT the same
+  // thing: the wheel only holds shares intermittently (from assignment
+  // until called away), so it only earns a dividend whose ex-date falls
+  // inside one of THOSE specific stretches, never the window as a whole.
+  const _sharesDividendsFor=(fromIdx,toIdx)=>{
+    const s=hist2y.timestamps?.[fromIdx],e=hist2y.timestamps?.[toIdx];
+    if(s==null||e==null)return 0;
+    return _sumDividendsInRange(dividends,_parseHist2yDate(s),_parseHist2yDate(e));
+  };
+
   while(true){
     // Only pass the earnings-date list through for leg types this
     // strategy actually restricts (Default strategy passes
     // earningsAvoidTypes=null, so this is always null there, and the
     // check inside _simulateOneCycle is skipped entirely -- Default's
     // output is untouched by any of this).
+    // Term-structure slope, recomputed fresh for THIS cycle's own entry
+    // point (curIdx) rather than once per ticker -- using the full 2-year
+    // history regardless of where a cycle falls within the simulated
+    // window would let a cycle "trading" a year ago see realized vol from
+    // its own future. See _estimateTermStructureSlope's asOfIdx comment.
     const applyEarnings=hasEarningsDates&&earningsAvoidTypes&&earningsAvoidTypes.includes(mode);
-    const cyc=_findFloorClearingCycle(hist2y,curIdx,monthsOut,targetFloorPct,mode,r,WHEELBT_MAX_MONTHS_OUT,termSlope,applyEarnings?earningsDates:null);
+    // r/q/termSlope are now computed INSIDE _findFloorClearingCycle, fresh
+    // for whichever day it actually ends up trying (see its own comment) --
+    // this call only supplies the flat-rate fallback and the raw dividend/
+    // ^IRX series it needs to do that per-day lookup itself.
+    const cyc=_findFloorClearingCycle(hist2y,curIdx,monthsOut,targetFloorPct,mode,r,WHEELBT_MAX_MONTHS_OUT,applyEarnings?earningsDates:null,dividends,irxHist2y,ladder);
     if(!cyc)break; // couldn't clear the floor at any DTE, at any remaining entry day -- stop here
     cyc.cyclePosition=trades.length+1; // 1-indexed position in the FULL sequence -- lets a truncated display show "cycle N of M" even when the shown slice doesn't start at the window's own true beginning
     trades.push(cyc);
     cumPremium+=cyc.premium;
     cyc.equityGainDollar=0; // default; only a called-away call leg realizes an equity gain/loss
+    cyc.legTotalDollar=cyc.premium; // updated below for an assigned call
 
     if(mode==='put'){
+      // A cash-secured put's real collateral is ALWAYS its own strike --
+      // never a carried-over amount from an unrelated prior cycle. This
+      // model is explicitly single-position and non-compounding (see the
+      // capital-ledger comment above), so there's no persistent cash pool
+      // concept for a "leftover" amount to mean anything.
+      const cashAmt=cyc.strike; // per-share
+      segments.push({startIdx:regimeStartIdx,endIdx:cyc.exitIdx,type:'cash',capital:cashAmt});
+      _accrueCashInterest(regimeStartIdx,cyc.exitIdx,cashAmt);
       if(cyc.assigned){
-        costBasis=cyc.strike-cyc.premium;
+        // Cost basis is the raw strike, NOT strike-minus-premium -- the put
+        // premium is already counted once via cumPremium above. Subtracting
+        // it again here would double-count it a second time through the
+        // resulting share-sale gain once the shares are later called away
+        // (or through the unrealized mark if the window ends while still
+        // holding them, below).
+        costBasis=cyc.strike;
+        regimeStartIdx=cyc.exitIdx+1;
         mode='call';
+      }else{
+        regimeStartIdx=cyc.exitIdx+1;
       }
     }else{ // mode === 'call'
       if(cyc.assigned){
         cyc.equityGainDollar=cyc.strike-costBasis;
+        cyc.legTotalDollar=cyc.premium+cyc.equityGainDollar;
         realizedShareGainLoss+=cyc.equityGainDollar;
+        segments.push({startIdx:regimeStartIdx,endIdx:cyc.exitIdx,type:'shares'});
+        shareDividends+=_sharesDividendsFor(regimeStartIdx,cyc.exitIdx);
         costBasis=null;
+        regimeStartIdx=cyc.exitIdx+1;
         mode='put';
       }
+      // else: call expired worthless, still holding shares -- the shares
+      // regime stays open (regimeStartIdx unchanged), mode stays 'call',
+      // loop continues searching for another call against the same shares.
     }
 
-    curIdx=cyc.exitIdx;
+    // Next cycle starts the trading day AFTER this one's expiration, not on
+    // the expiration day itself -- hist2y's arrays only contain actual
+    // trading days, so +1 here always lands on a real next trading day, no
+    // further date resolution needed. Matches your actual stated practice.
+    curIdx=cyc.exitIdx+1;
     if(curIdx>=startIdx+tradingDaysInYear)break; // let the in-progress cycle finish naturally, then stop
   }
 
   if(!trades.length)return null;
   const endIdx=trades[trades.length-1].exitIdx;
+  // Terminal cash-interest correction. _accrueCashInterest's loop (above)
+  // weights each day by the calendar gap to the NEXT trading day in the
+  // full history, unbounded -- correct for every INTERNAL day, since cash
+  // genuinely continues being held through that gap while the simulation
+  // keeps going. But when the window's own LAST cycle is a put (cash), that
+  // same loop's final iteration (i===cyc.exitIdx===endIdx) also reached past
+  // the window's own reported end this way, accruing interest for however
+  // many calendar days sit between endIdx and whatever trading day happens
+  // to follow it in the full history -- real time the window doesn't claim
+  // to model (elapsedCalendarDaysApprox, below, stops exactly at endDate).
+  // The fix is retroactive rather than a change inside the loop itself,
+  // because whether a given cycle's own exitIdx will turn out to BE endIdx
+  // isn't knowable until the whole loop above has finished -- every other
+  // cycle's identical-looking extension across that same boundary is
+  // correct, since the simulation genuinely continues past it for them.
+  if(irxHist2y){
+    const _lastTrade=trades[trades.length-1];
+    if(_lastTrade.optionType==='put'){
+      const _lastDateMs=hist2y.timestamps?.[endIdx]!=null?hist2y.timestamps[endIdx]*1000:null;
+      const _nextDateMs=hist2y.timestamps?.[endIdx+1]!=null?hist2y.timestamps[endIdx+1]*1000:null;
+      if(_lastDateMs!=null&&_nextDateMs!=null){
+        const _rate=_irxRateAsOf(irxHist2y,_lastDateMs);
+        if(_rate!=null){
+          const _actualWeight=Math.max(1,Math.round((_nextDateMs-_lastDateMs)/86400000));
+          const _correctWeight=1; // the window's own last reported day, nothing past it
+          if(_actualWeight>_correctWeight)cashInterest-=_lastTrade.strike*_rate/365*(_actualWeight-_correctWeight);
+        }
+      }
+    }
+  }
   const startDateRaw=hist2y.timestamps?.[startIdx],endDateRaw=hist2y.timestamps?.[endIdx];
   if(startDateRaw==null||endDateRaw==null)return null;
   const startDate=_parseHist2yDate(startDateRaw);
@@ -438,38 +811,260 @@ function _simulateWheelWindow(hist2y,startIdx,monthsOut,targetFloorPct,r,termSlo
   if(endPrice==null||elapsedCalendarDaysApprox<=0)return null;
 
   // If still holding shares (mid-CC-cycle) at window end, mark unrealized
-  // gain/loss vs cost basis so the total isn't silently missing that leg.
+  // gain/loss vs cost basis so the total isn't silently missing that leg,
+  // and close out the open shares segment through the window's actual end
+  // so its capital is counted in the time-weighted base below.
   const unrealizedShareGainLoss=costBasis!=null?(endPrice-costBasis):0;
-  const totalPnL=cumPremium+realizedShareGainLoss+unrealizedShareGainLoss;
+  const unrealizedShareDividends=costBasis!=null?_sharesDividendsFor(regimeStartIdx,endIdx):0;
+  if(mode==='call'&&costBasis!=null){
+    segments.push({startIdx:regimeStartIdx,endIdx,type:'shares'});
+  }
+  const totalPnL=cumPremium+realizedShareGainLoss+unrealizedShareGainLoss+cashInterest+shareDividends+unrealizedShareDividends;
 
-  // Capital base: the AVERAGE of each cycle's own spot price at entry, not
-  // just the window's day-1 starting price. This matters a lot on a
-  // volatile underlying -- a stock that rallies hard during the window
-  // means real committed capital (the value of shares held, or the strike
-  // securing a new put) grows right along with it, but a fixed day-1
-  // denominator stays frozen, silently understating the true capital base
-  // for every later cycle and inflating the resulting annualized return.
-  // Averaging each cycle's actual entry price captures that a real trader
-  // would have had progressively more capital at risk as the stock rose
-  // (or less, if it fell), without introducing full compounding -- still
-  // one total P&L divided by one denominator, matching _calcIncome's own
-  // simple/linear convention so this stays directly comparable to a
-  // target APY input.
-  const avgCapitalBase=trades.reduce((s,t)=>s+t.spotAtEntry,0)/trades.length;
+  // Time-weighted capital base -- replaces a flat average of each cycle's
+  // entry-point spot price with the actual capital ledger built above:
+  // strike-based collateral while a put is open (matching how a real CSP
+  // position is valued in the Income tab), daily marked share value while
+  // holding (not frozen at the entry price), and idle cash properly
+  // counted rather than silently vanishing from the denominator during a
+  // multi-day search for a floor-clearing entry.
+  const avgCapitalBase=_timeWeightedCapitalBase(segments,closes);
+  if(avgCapitalBase==null||avgCapitalBase<=0)return null;
 
-  // Second pass, now that avgCapitalBase is known: tag each cycle with its
-  // own leg contribution and a RUNNING cumulative return, computed over
-  // the FULL trades array (not whatever slice ends up displayed) -- so if
-  // only the last 8 of a longer chain get shown, their cumulative values
-  // still correctly reflect everything that came before, not just the
-  // visible rows. Uses the same simple/linear (non-compounded) convention
-  // as the window's own headline return, so the last row's cumulative
-  // value reconciles exactly with the window's total realized P&L.
-  let runningDollar=0;
-  trades.forEach(t=>{
-    t.legTotalDollar=t.premium+t.equityGainDollar;
-    runningDollar+=t.legTotalDollar;
-    t.cumulativePct=(runningDollar/avgCapitalBase)*100;
+  // Second pass: replay the SAME cash/shares regime transitions over the
+  // now-complete trades array to compute a running, time-weighted-SO-FAR
+  // capital base and P&L at each cycle's own exit -- deliberately not the
+  // window's final average applied retroactively to an earlier point,
+  // which would let that point's displayed % reflect information (the
+  // eventual final average) that wasn't actually known yet at that point
+  // in time. Same "nothing sees its own future" principle as the
+  // term-structure fix, just showing up in a display context here. An
+  // in-progress (not-yet-assigned) shares regime's running total is used
+  // "as if closed right now" for this specific calculation, without folding
+  // it into the base totals used for the next cycle's own accounting (see
+  // _baseDD/_curDD below).
+  let runningPremium=0,runningShareGain=0,runningInterest=0,runningDividends=0;
+  // Incremental replacement for the old segsSoFar array + full-rescan
+  // _timeWeightedCapitalBase([...segsSoFar,seg],closes) call on EVERY
+  // trading day: that pattern re-summed the CURRENT regime's entire share
+  // price history from its own start on every single day, making a long
+  // share-holding stretch (see multiUnassignedCallHold in the test corpus)
+  // quadratic in its own length. _baseDD/_baseD are the running dollar-days/
+  // days contributed by every regime that has ALREADY closed (what used to
+  // live in segsSoFar); _curDD/_curD are the CURRENTLY OPEN regime's own
+  // running total, extended by one day at a time and folded into the base
+  // totals only once that regime actually closes (mirroring exactly when
+  // the old code called segsSoFar.push). The capital base for "everything up
+  // to and including today" is then (_baseDD+_curDD)/(_baseD+_curD) -- O(1)
+  // per day instead of O(regime length). A day with a null close still
+  // counts toward _curD (it still occupies a day-slot, per
+  // _timeWeightedCapitalBase's own days=endIdx-startIdx+1 semantics) but
+  // contributes 0 to _curDD, exactly matching the old per-call rescan.
+  let _baseDD=0,_baseD=0,_curDD=0,_curD=0;
+  let rsIdx=startIdx,curMode='put',replayCostBasis=null;
+
+  // ── Daily mark-to-model drawdown ────────────────────────────────────────
+  // The cycle-exit rows below give the P&L curve only at option expirations.
+  // A stock can fall hard mid-cycle and recover before expiry, and an open
+  // short option carries a real (unrealized) liability the whole time. So for
+  // every trading day between one expiration and the next, compute the same
+  // P&L the exit rows use -- premium, share mark, dividends, interest -- plus
+  // the open option's MODELED liability (Black-Scholes with the same
+  // sigma/r/q/strike it was priced with at entry, and the calendar time
+  // actually left), over the same running time-weighted capital base as of
+  // that day (nothing sees its own future). On an expiration day itself the
+  // curve IS the exit row (t.cumulativePct), so it ties exactly to the
+  // reconciled ledger, and the daily max drawdown can never be smaller than
+  // the expiration-sampled one. Modeled, not real quotes: volatility is held
+  // at its entry value (no IV spikes), so a real crash would likely mark worse.
+  let lastCoveredIdx=startIdx-1,ddPeak=0,ddMax=0; // peak starts at 0 -- the window's own true starting point, same as _maxDrawdownPct
+  // A SEPARATE, genuinely equity-based drawdown series, alongside the one
+  // above. The metric above (ddPeak/ddMax) is "cumulative $ P&L as a % of
+  // the RUNNING TIME-WEIGHTED AVERAGE capital deployed so far" -- and that
+  // average denominator moves as the cash/shares regime mix changes over
+  // the window (e.g. rolling into a higher-priced share regime raises the
+  // average), which can make the ratio fall even when actual dollar
+  // equity hasn't -- a real, confirmed artifact of the denominator, not
+  // of any capital loss.
+  // This second series instead builds a genuine equity curve
+  // (equity_t = starting capital + cumulative $ P&L, using a FIXED
+  // starting capital -- the capital actually committed on the window's
+  // own first day, captured once below and never revised) and computes
+  // the STANDARD drawdown definition against it: at each point, the
+  // decline from the RUNNING PEAK EQUITY reached so far, as a percentage
+  // OF THAT PEAK -- Drawdown_t=(Peak_equity_t-Equity_t)/Peak_equity_t.
+  // Peak equity is itself a moving reference (it only ever rises), not a
+  // second fixed value -- an earlier build normalized the decline by the
+  // fixed starting capital instead of the peak actually reached, which
+  // overstates drawdown for any window with real gains before a pullback
+  // (a $100->$200->$150 path is a genuine 25% drawdown from its $200
+  // peak, not 50% of the original $100 -- see tests/wheel-drawdown.test.js
+  // for the corrected worked example and a negative control reproducing
+  // the earlier, wrong 50% reading).
+  let eqFixedCap=null,peakEquity=null,eqDDMax=0;
+  const dailyCurve=(opts&&opts.keepDailyCurve)?[]:null;
+  const _ddPoint=(idx,pct,dollarPnL,capBase)=>{
+    if(pct==null||!isFinite(pct))return;
+    if(pct>ddPeak)ddPeak=pct;
+    if(ddPeak-pct>ddMax)ddMax=ddPeak-pct;
+    if(dailyCurve)dailyCurve.push({idx,pct});
+    if(dollarPnL!=null&&isFinite(dollarPnL)&&capBase>0){
+      if(eqFixedCap==null){eqFixedCap=capBase;peakEquity=eqFixedCap;} // starting equity = starting capital, before this window's own first day of P&L
+      const equity=eqFixedCap+dollarPnL;
+      if(equity>peakEquity)peakEquity=equity;
+      if(peakEquity>0){
+        const dd=(peakEquity-equity)/peakEquity*100;
+        if(dd>eqDDMax)eqDDMax=dd;
+      }
+    }
+  };
+  // One day's cash interest, calendar-day weighted -- same formula as the
+  // interest loops above (kept as its own closure so those stay untouched).
+  const _dayInterest=(i,capital)=>{
+    const dateMs=hist2y.timestamps?.[i]!=null?hist2y.timestamps[i]*1000:null;
+    if(dateMs==null||!irxHist2y)return 0;
+    const rate=_irxRateAsOf(irxHist2y,dateMs);
+    if(rate==null)return 0;
+    // Same terminal-boundary fix as the aggregate cashInterest correction
+    // above (see its comment): the window's own last day (i===endIdx) gets
+    // weight 1, not the calendar gap to whatever trading day happens to
+    // follow it in the full history -- that gap is real time the window
+    // doesn't claim to model. Every earlier day still correctly extends
+    // through its own gap, since the simulation genuinely continues there.
+    const nextDateMs=i<endIdx&&hist2y.timestamps?.[i+1]!=null?hist2y.timestamps[i+1]*1000:null;
+    const daysWeight=nextDateMs!=null?Math.max(1,Math.round((nextDateMs-dateMs)/86400000)):1;
+    return capital*rate/365*daysWeight;
+  };
+  // Same value as _parseHist2yDate(raw).getTime() without allocating a Date
+  // (this runs once per trading day, so it matters).
+  const _rawMs=raw=>typeof raw==='number'?(raw<1e10?raw*1000:raw):_parseHist2yDate(raw).getTime();
+  // Dividend ex-dates parsed ONCE per window (identical values to what
+  // _sumDividendsInRange parses on every call) for the per-day share-dividend
+  // accrual; same inclusive [start,end] comparison.
+  const _divEvents=(dividends&&dividends.length)?dividends.filter(d=>d&&d.date&&d.amount!=null).map(d=>({ms:new Date(d.date+'T12:00:00Z').getTime(),amt:d.amount})):null;
+  const _divsBetweenMs=(sMs,eMs)=>{
+    if(!_divEvents)return 0;
+    let sum=0;
+    for(const d of _divEvents)if(d.ms>=sMs&&d.ms<=eMs)sum+=d.amt;
+    return sum;
+  };
+  // The open short option's modeled value on day i (what it would cost to
+  // buy back): dNowMs is today's date, expMs the option's expiration date.
+  const _optValueAt=(t,i,dNowMs,expMs)=>{
+    const S_i=closes[i];
+    const intrinsic=t.optionType==='put'?Math.max(t.strike-S_i,0):Math.max(S_i-t.strike,0);
+    if(i>=t.exitIdx)return intrinsic; // expiration day: settles at intrinsic
+    const T=Math.max((expMs-dNowMs)/(365*86400000),1e-9);
+    const v=t.optionType==='put'?_bsPutPrice(S_i,t.strike,T,t.pricingR,t.pricingSigma,t.pricingQ):_bsCallPrice(S_i,t.strike,T,t.pricingR,t.pricingSigma,t.pricingQ);
+    return isFinite(v)?v:intrinsic;
+  };
+
+  trades.forEach((t,ti)=>{
+    // Daily points for every trading day since the previous expiration, using
+    // the PRE-trade state -- nothing below has been applied yet. The exit
+    // day is evaluated too, but only to tie out against the ledger row.
+    {
+      let intr=runningInterest;
+      const cashAmt=t.strike;
+      const expMs=_rawMs(hist2y.timestamps[t.exitIdx]);
+      const holdStartMs=(curMode==='call'&&replayCostBasis!=null&&hist2y.timestamps?.[rsIdx]!=null)?_rawMs(hist2y.timestamps[rsIdx]):null;
+      for(let i=lastCoveredIdx+1;i<=t.exitIdx;i++){
+        const px=closes[i];
+        // Extend the currently-open regime by exactly this one day -- O(1),
+        // replacing the old full re-sum of the whole regime on every day.
+        // This must happen for EVERY day in range, independent of whether a
+        // point can actually be emitted below: _timeWeightedCapitalBase's
+        // own day-count (endIdx-startIdx+1) counts every index in a
+        // segment's range unconditionally, and a 'cash' day's dollar-days
+        // don't depend on price at all -- only a 'shares' day's dollar-days
+        // needs a non-null price to contribute (matching that function's
+        // `if(px!=null)totalDollarDays+=px`). Getting this wrong silently
+        // undercounts every later day's denominator whenever a close is
+        // null anywhere earlier in the same regime.
+        _curD+=1;
+        if(curMode==='call'&&replayCostBasis!=null){
+          if(px!=null)_curDD+=px;
+        }else{
+          _curDD+=cashAmt;
+        }
+        if(px==null||hist2y.timestamps?.[i]==null)continue; // can't mark this specific day without a price -- no point emitted, but the day-count above still stands
+        const dNowMs=_rawMs(hist2y.timestamps[i]);
+        if(curMode==='put')intr+=_dayInterest(i,cashAmt); // interest only accrues while holding cash (call mode: none)
+        let eq=runningPremium+runningShareGain+runningDividends+intr;
+        if(curMode==='call'&&replayCostBasis!=null){
+          eq+=(px-replayCostBasis)+(holdStartMs!=null?_divsBetweenMs(holdStartMs,dNowMs):0);
+        }
+        if(i>=t.entryIdx)eq+=t.premium-_optValueAt(t,i,dNowMs,expMs);
+        const _capD=_baseD+_curD;
+        const cap=_capD>0?(_baseDD+_curDD)/_capD:null;
+        const pct=cap>0?eq/cap*100:null;
+        if(i<t.exitIdx)_ddPoint(i,pct,eq,cap);
+        else if(dailyCurve&&pct!=null&&isFinite(pct))dailyCurve.push({idx:i,pct,exitFormula:true}); // tie-out only, never feeds the drawdown
+      }
+    }
+    runningPremium+=t.premium;
+    runningShareGain+=t.equityGainDollar;
+    let capSoFar;
+    if(curMode==='put'){
+      const cashAmt=t.strike; // per-share -- always this cycle's own strike, mirrors the main loop above
+      for(let i=rsIdx;i<=t.exitIdx;i++){
+        const dateMs=hist2y.timestamps?.[i]!=null?hist2y.timestamps[i]*1000:null;
+        if(dateMs==null)continue;
+        const rate=irxHist2y?_irxRateAsOf(irxHist2y,dateMs):null;
+        if(rate==null)continue;
+        // Same calendar-day weighting as _accrueCashInterest above, INCLUDING
+        // its terminal-boundary fix: a THIRD copy of this exact calculation
+        // (missed in the build that added the other two -- see that fix's
+        // own comment on _accrueCashInterest for the reasoning) that feeds
+        // t.cumulativePct specifically. Left uncorrected, this copy and the
+        // other two would disagree with each other for the window's own
+        // final day, breaking the reconciliation between the daily curve
+        // and this per-trade ledger row that the rest of this file
+        // otherwise guarantees.
+        const nextDateMs=i<endIdx&&hist2y.timestamps?.[i+1]!=null?hist2y.timestamps[i+1]*1000:null;
+        const daysWeight=nextDateMs!=null?Math.max(1,Math.round((nextDateMs-dateMs)/86400000)):1;
+        runningInterest+=cashAmt*rate/365*daysWeight;
+      }
+      // A put cycle's cash regime ALWAYS closes exactly at its own exit
+      // (never carries into the next cycle) -- _curDD/_curD were already
+      // extended through t.exitIdx by the per-day loop above, so they now
+      // hold exactly this closed segment's own totals; fold them into the
+      // base and reset for whatever regime starts next.
+      capSoFar=(_baseD+_curD)>0?(_baseDD+_curDD)/(_baseD+_curD):null;
+      _baseDD+=_curDD;_baseD+=_curD;_curDD=0;_curD=0;
+      rsIdx=t.exitIdx+1;
+      if(t.assigned){replayCostBasis=t.strike;curMode='call';}
+    }else{ // curMode==='call'
+      // Same identity as above: _curDD/_curD already hold this shares
+      // regime's totals through t.exitIdx (whether it started this cycle or
+      // several unassigned-call cycles ago).
+      capSoFar=(_baseD+_curD)>0?(_baseDD+_curDD)/(_baseD+_curD):null;
+      if(t.assigned){
+        _baseDD+=_curDD;_baseD+=_curD;_curDD=0;_curD=0;
+        runningDividends+=_sharesDividendsFor(rsIdx,t.exitIdx);
+        replayCostBasis=null;
+        rsIdx=t.exitIdx+1;
+        curMode='put';
+      }
+      // else: stays open -- base totals NOT folded, rsIdx unchanged, _curDD/
+      // _curD simply keep accumulating through the next cycle's per-day
+      // loop, so the NEXT cycle's "as if closed now" figure still reflects
+      // the true beginning of this still-open holding stretch.
+    }
+    // Unrealized mark, recomputed FRESH at every row where a shares regime
+    // is currently open -- not just the window's final row as before. A
+    // not-yet-assigned call sitting on a real paper gain or loss should
+    // show up in the running curve (and therefore in max drawdown) at the
+    // point it actually exists, not only once it's eventually realized via
+    // assignment or the window ends. Never accumulated into runningShareGain
+    // itself -- purely a transient add-back each time, replaced by the real
+    // realized equityGainDollar once the shares are actually called away.
+    const unrealizedSoFar=(curMode==='call'&&replayCostBasis!=null)?(closes[t.exitIdx]-replayCostBasis):0;
+    const unrealizedDivSoFar=(curMode==='call'&&replayCostBasis!=null)?_sharesDividendsFor(rsIdx,t.exitIdx):0;
+    const runningDollar=runningPremium+runningShareGain+runningInterest+runningDividends+unrealizedSoFar+unrealizedDivSoFar;
+    t.cumulativePct=capSoFar>0?(runningDollar/capSoFar)*100:null;
+    _ddPoint(t.exitIdx,t.cumulativePct,runningDollar,capSoFar); // expiration day = the reconciled ledger row itself
+    lastCoveredIdx=t.exitIdx;
   });
 
   const simpleReturn=totalPnL/avgCapitalBase;
@@ -483,7 +1078,7 @@ function _simulateWheelWindow(hist2y,startIdx,monthsOut,targetFloorPct,r,termSlo
   const assignedCount=trades.filter(t=>t.assigned).length;
   const assignmentRatePct=trades.length?assignedCount/trades.length*100:0;
 
-  const buyHoldReturn=(endPrice-startPrice)/startPrice;
+  const buyHoldReturn=(endPrice-startPrice+_sumDividendsInRange(dividends,startDate,endDate))/startPrice;
   const buyHoldAnnualizedPct=buyHoldReturn*(365/elapsedCalendarDaysApprox)*100;
 
   return{
@@ -492,7 +1087,11 @@ function _simulateWheelWindow(hist2y,startIdx,monthsOut,targetFloorPct,r,termSlo
     elapsedCalendarDaysApprox,avgCapitalBase,
     simpleReturnPct:simpleReturn*100, // raw, unannualized total -- what the row-by-row cumulative actually adds up to
     stillHoldingShares:costBasis!=null,
-    unrealizedShareGainLoss,
+    unrealizedShareGainLoss,cashInterest,shareDividends,unrealizedShareDividends,
+    maxDrawdownDailyPct:ddMax, // daily mark-to-model, relative to the RUNNING TIME-WEIGHTED AVERAGE capital base (not a strict equity drawdown -- see maxDrawdownEquityPct for that; kept for comparison/backward reference)
+    maxDrawdownEquityPct:eqDDMax, // standard Drawdown_t=(Peak_equity_t-Equity_t)/Peak_equity_t -- Peak_equity_t is a RUNNING peak (rises as new highs are reached), not the fixed starting capital -- the figure shown as "Max drawdown" in the UI
+    maxDrawdownAtExpPct:_maxDrawdownPct(trades), // sampled only at expirations (pre-478 metric) -- kept for comparison
+    ...(dailyCurve?{dailyCurve}:{}),
   };
 }
 
@@ -554,12 +1153,14 @@ function _computeWheelBacktestFullHistory(ticker,monthsOut,targetFloorPct,strate
   if(!h2?.closes?.length||!h2.timestamps||!h2.opens||!h2.highs||!h2.lows)return null;
   const rRaw=_getTBillYield();
   const r=(rRaw!=null?rRaw:4.0)/100;
-  const termSlope=_estimateTermStructureSlope(h2);
   const earningsAvoidTypes=_wheelBacktestEarningsAvoidTypes(strategy);
   const earningsDates=earningsAvoidTypes?_getEarningsAvoidDates(ticker):null;
+  const dividends=S.get('div_hist_'+ticker)?.distributions||null;
+  const irxHist2y=S.get('hist2y_irx')||null;
   const starts=_enumerateMonthlyStartIndices(h2);
   if(!starts.length)return null;
-  const win=_simulateWheelWindow(h2,starts[0],monthsOut,targetFloorPct,r,termSlope,Infinity,earningsDates,earningsAvoidTypes);
+  const ladder=_inferStrikeLadder(ticker); // computed once -- this function only ever simulates one window
+  const win=_simulateWheelWindow(h2,starts[0],monthsOut,targetFloorPct,r,Infinity,earningsDates,earningsAvoidTypes,dividends,irxHist2y,undefined,ladder);
   if(!win||!win.trades.length)return null;
   return{
     ticker,trades:win.trades,startIdx:win.startIdx,endIdx:win.endIdx,
@@ -577,19 +1178,21 @@ function _computeWheelBacktest(ticker,monthsOut,targetFloorPct,strategy){
   const rRaw=_getTBillYield();
   const r=(rRaw!=null?rRaw:4.0)/100; // fallback if T-bill cache unavailable; rate has a small effect on BS price relative to sigma
   const MIN_COMPLETE_DAYS=300; // ~a full year, allowing some slack for real monthly spacing not being perfectly uniform
-  const termSlope=_estimateTermStructureSlope(h2); // once per ticker, applied uniformly across every window below
   const earningsAvoidTypes=_wheelBacktestEarningsAvoidTypes(strategy);
   const earningsDates=earningsAvoidTypes?_getEarningsAvoidDates(ticker):null;
+  const dividends=S.get('div_hist_'+ticker)?.distributions||null;
+  const irxHist2y=S.get('hist2y_irx')||null;
 
   const windows=[];
+  const ladder=_inferStrikeLadder(ticker); // computed once for this whole run, not once per window (there can be a couple dozen)
   _enumerateMonthlyStartIndices(h2).forEach(startIdx=>{
-    const win=_simulateWheelWindow(h2,startIdx,monthsOut,targetFloorPct,r,termSlope,undefined,earningsDates,earningsAvoidTypes);
+    const win=_simulateWheelWindow(h2,startIdx,monthsOut,targetFloorPct,r,undefined,earningsDates,earningsAvoidTypes,dividends,irxHist2y,undefined,ladder);
     if(win&&win.elapsedCalendarDaysApprox>=MIN_COMPLETE_DAYS)windows.push(win);
   });
   if(!windows.length)return null;
 
   const annReturns=windows.map(w=>w.annualizedReturnPct).sort((a,b)=>a-b);
-  const median=annReturns[Math.floor(annReturns.length/2)];
+  const median=_medianOfSorted(annReturns);
   const worst=annReturns[0];
   const best=annReturns[annReturns.length-1];
   const avgAssignmentRate=windows.reduce((s,w)=>s+w.assignmentRatePct,0)/windows.length;
@@ -597,12 +1200,32 @@ function _computeWheelBacktest(ticker,monthsOut,targetFloorPct,strategy){
   const avgBuyHold=windows.reduce((s,w)=>s+w.buyHoldAnnualizedPct,0)/windows.length;
   const pctBeatTarget=(annReturns.filter(v=>v>=targetFloorPct).length/annReturns.length)*100;
 
+  // Win rate (% of windows with a positive return) and beat-buy-hold rate
+  // (% of windows where the wheel actually outperformed, not just the
+  // averaged delta -- a single average can be dominated by one or two
+  // extreme windows and hide that the wheel loses more often than it wins).
+  const winRatePct=(annReturns.filter(v=>v>0).length/annReturns.length)*100;
+  const beatBuyHoldPct=(windows.filter(w=>w.annualizedReturnPct>w.buyHoldAnnualizedPct).length/windows.length)*100;
+  const excessReturns=windows.map(w=>w.annualizedReturnPct-w.buyHoldAnnualizedPct).sort((a,b)=>a-b);
+  const medianExcessReturn=_medianOfSorted(excessReturns);
+  // Drawdown ordering is the OPPOSITE of the return worst/best above --
+  // here a LARGER number is worse (a deeper decline), so "worst" is the
+  // max of the sorted-ascending array, not the min.
+  const drawdowns=windows.map(w=>w.maxDrawdownDailyPct).sort((a,b)=>a-b);
+  const drawdown={best:drawdowns[0],median:_medianOfSorted(drawdowns),worst:drawdowns[drawdowns.length-1]};
+  const drawdownsEquity=windows.map(w=>w.maxDrawdownEquityPct).sort((a,b)=>a-b);
+  const drawdownEquity={best:drawdownsEquity[0],median:_medianOfSorted(drawdownsEquity),worst:drawdownsEquity[drawdownsEquity.length-1]};
+  const drawdownsAtExp=windows.map(w=>w.maxDrawdownAtExpPct).sort((a,b)=>a-b);
+  const drawdownAtExp={best:drawdownsAtExp[0],median:_medianOfSorted(drawdownsAtExp),worst:drawdownsAtExp[drawdownsAtExp.length-1]};
+  const downsideDeviation=_downsideDeviationPct(annReturns);
+
   const mostRecentWindow=windows[windows.length-1];
 
   return{
     ticker,monthsOut,targetFloorPct,strategy:strategy||'default',sampleSize:windows.length,
     median,worst,best,avgAssignmentRate,avgAnnReturn,avgBuyHold,pctBeatTarget,
     vsBuyHold:avgAnnReturn-avgBuyHold,
+    winRatePct,beatBuyHoldPct,medianExcessReturn,drawdown,drawdownEquity,drawdownAtExp,downsideDeviation,
     recentCycles:mostRecentWindow.trades,
     recentRunStartIdx:mostRecentWindow.startIdx,
     recentRunEndIdx:mostRecentWindow.endIdx,
@@ -626,6 +1249,7 @@ function _computeWheelBacktestAggregate(tickers,monthsOut,targetFloorPct,strateg
   let allReturns=[];
   let allAssignmentRates=[];
   let allBuyHold=[];
+  let allWindowDD=[],allWindowDDEquity=[],allWindowDDAtExp=[]; // per-window max drawdown (daily-marked capital-relative, daily-marked equity-based, and the older expiration-sampled figure), index-aligned with allReturns
   let tickersWithData=0;
   // Tracks the single most CALENDAR-RECENT complete run across every
   // ticker in the list -- not just whichever ticker happens to be iterated
@@ -638,20 +1262,25 @@ function _computeWheelBacktestAggregate(tickers,monthsOut,targetFloorPct,strateg
   // -- reused by the "Best Tickers" ranking view so it doesn't need its
   // own separate full computation pass over the whole watchlist.
   const perTickerReturns={};
+  const irxHist2y=S.get('hist2y_irx')||null; // shared across every ticker, read once rather than per-iteration
 
   tickers.forEach(t=>{
     const h2=S.get('hist2y_'+t);
     if(!h2?.closes?.length||!h2.timestamps||!h2.opens||!h2.highs||!h2.lows)return;
-    const termSlope=_estimateTermStructureSlope(h2);
     const earningsDates=earningsAvoidTypes?_getEarningsAvoidDates(t):null;
+    const dividends=S.get('div_hist_'+t)?.distributions||null;
     let gotAny=false;
     perTickerReturns[t]=[];
+    const ladder=_inferStrikeLadder(t); // once per ticker, not once per window
     _enumerateMonthlyStartIndices(h2).forEach(startIdx=>{
-      const win=_simulateWheelWindow(h2,startIdx,monthsOut,targetFloorPct,r,termSlope,undefined,earningsDates,earningsAvoidTypes);
+      const win=_simulateWheelWindow(h2,startIdx,monthsOut,targetFloorPct,r,undefined,earningsDates,earningsAvoidTypes,dividends,irxHist2y,undefined,ladder);
       if(win&&win.elapsedCalendarDaysApprox>=MIN_COMPLETE_DAYS){
         allReturns.push(win.annualizedReturnPct);
         allAssignmentRates.push(win.assignmentRatePct);
         allBuyHold.push(win.buyHoldAnnualizedPct);
+        allWindowDD.push(win.maxDrawdownDailyPct);
+        allWindowDDEquity.push(win.maxDrawdownEquityPct);
+        allWindowDDAtExp.push(win.maxDrawdownAtExpPct);
         perTickerReturns[t].push(win.annualizedReturnPct);
         gotAny=true;
         const rawEndDate=h2.timestamps?.[win.endIdx];
@@ -665,8 +1294,26 @@ function _computeWheelBacktestAggregate(tickers,monthsOut,targetFloorPct,strateg
   });
 
   if(!allReturns.length)return null;
+
+  // Paired stats computed BEFORE allReturns gets sorted below (in place) --
+  // these need allReturns/allBuyHold/allWindowDD to stay in their
+  // original, index-aligned push order to correctly match each window's
+  // return against that SAME window's own buy-hold result and trades.
+  const winRatePct=(allReturns.filter(v=>v>0).length/allReturns.length)*100;
+  const beatBuyHoldCount=allReturns.filter((v,i)=>v>allBuyHold[i]).length;
+  const beatBuyHoldPct=(beatBuyHoldCount/allReturns.length)*100;
+  const excessReturns=allReturns.map((v,i)=>v-allBuyHold[i]).sort((a,b)=>a-b);
+  const medianExcessReturn=_medianOfSorted(excessReturns);
+  const drawdowns=[...allWindowDD].sort((a,b)=>a-b);
+  const drawdown={best:drawdowns[0],median:_medianOfSorted(drawdowns),worst:drawdowns[drawdowns.length-1]};
+  const drawdownsEquity=[...allWindowDDEquity].sort((a,b)=>a-b);
+  const drawdownEquity={best:drawdownsEquity[0],median:_medianOfSorted(drawdownsEquity),worst:drawdownsEquity[drawdownsEquity.length-1]};
+  const drawdownsAtExp=[...allWindowDDAtExp].sort((a,b)=>a-b);
+  const drawdownAtExp={best:drawdownsAtExp[0],median:_medianOfSorted(drawdownsAtExp),worst:drawdownsAtExp[drawdownsAtExp.length-1]};
+  const downsideDeviation=_downsideDeviationPct(allReturns);
+
   allReturns.sort((a,b)=>a-b);
-  const median=allReturns[Math.floor(allReturns.length/2)];
+  const median=_medianOfSorted(allReturns);
   const worst=allReturns[0];
   const best=allReturns[allReturns.length-1];
   const avgAnnReturn=allReturns.reduce((s,v)=>s+v,0)/allReturns.length;
@@ -686,7 +1333,7 @@ function _computeWheelBacktestAggregate(tickers,monthsOut,targetFloorPct,strateg
       const sorted=[...arr].sort((a,b)=>a-b);
       return{
         ticker:t,sampleSize:sorted.length,
-        worst:sorted[0],median:sorted[Math.floor(sorted.length/2)],best:sorted[sorted.length-1],
+        worst:sorted[0],median:_medianOfSorted(sorted),best:sorted[sorted.length-1],
       };
     })
     .sort((a,b)=>b.median-a.median);
@@ -695,6 +1342,7 @@ function _computeWheelBacktestAggregate(tickers,monthsOut,targetFloorPct,strateg
     monthsOut,targetFloorPct,strategy:strategy||'default',sampleSize:allReturns.length,tickersWithData,tickersTotal:tickers.length,
     median,worst,best,avgAssignmentRate,avgAnnReturn,avgBuyHold,pctBeatTarget,
     vsBuyHold:avgAnnReturn-avgBuyHold,
+    winRatePct,beatBuyHoldPct,medianExcessReturn,drawdown,drawdownEquity,drawdownAtExp,downsideDeviation,
     recentCycles:bestRunCycles,recentCyclesTicker:bestRunTicker,
     recentRunStartIdx:bestRunStartIdx,recentRunEndIdx:bestRunEndIdx,recentRunTotalCycles:bestRunTotalCycles,
     recentRunSimpleReturnPct:bestRunSimpleReturnPct,recentRunStillHoldingShares:bestRunStillHoldingShares,
@@ -727,14 +1375,18 @@ function _populateWheelBacktestDropdown(){
 // Conviction Scoring's own fallback, purely because that's this app's
 // existing convention, not because the two are linked.
 function getWheelBacktestTargetAPY(){
-  const stored=parseFloat(S.get('wheelbt_target_apy'));
-  return(!isNaN(stored)&&stored>0)?stored:WHEELBT_DEFAULT_TARGET_APY;
+  return finiteNumber(S.get('wheelbt_target_apy'),{min:0.01,max:500,fallback:WHEELBT_DEFAULT_TARGET_APY});
+}
+// On by default -- explicit 'false' is the only way to disable, so an
+// unset value (the normal case) keeps today's behavior.
+function getTermStructureEnabled(){
+  return S.get('wheelbt_term_structure_enabled')!=='false';
 }
 function setWheelBacktestTargetAPY(){
   const input=document.getElementById('wheelbt-target-apy-input');
   if(!input)return;
-  const val=parseFloat(input.value);
-  if(!isNaN(val)&&val>0){
+  const val=finiteNumber(input.value,{min:0.01,max:500});
+  if(val!=null){
     S.set('wheelbt_target_apy',val);
     refreshWheelBacktestViews();
   }
@@ -888,20 +1540,29 @@ function renderWheelBacktest(){
   // deferred one tick so the "Computing..." state actually paints first
   // rather than the whole thing blocking in one frame.
   setTimeout(()=>{
-    let result,isAggregate=!selectedTicker;
-    if(isStarredMode){
-      const starredList=watchlist.filter(t=>_starredTickers().has(t));
-      if(!starredList.length){
-        content.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>No starred tickers yet -- tap the star on a ticker in the Watchlist tab to add one.</div>';
-        return;
+    // Wrapped so a genuine bug in the computation surfaces as a visible,
+    // readable error instead of leaving "Computing..." frozen forever with
+    // no information -- silent hangs are worse than an ugly error message,
+    // since there's nothing to diagnose from a hang.
+    try{
+      let result,isAggregate=!selectedTicker;
+      if(isStarredMode){
+        const starredList=watchlist.filter(t=>_starredTickers().has(t));
+        if(!starredList.length){
+          content.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>No starred tickers yet -- tap the star on a ticker in the Watchlist tab to add one.</div>';
+          return;
+        }
+        result=_computeWheelBacktestAggregate(starredList,monthsOut,target,strategy);
+      }else if(isAggregate){
+        result=_computeWheelBacktestAggregate(watchlist,monthsOut,target,strategy);
+      }else{
+        result=_computeWheelBacktest(selectedTicker,monthsOut,target,strategy);
       }
-      result=_computeWheelBacktestAggregate(starredList,monthsOut,target,strategy);
-    }else if(isAggregate){
-      result=_computeWheelBacktestAggregate(watchlist,monthsOut,target,strategy);
-    }else{
-      result=_computeWheelBacktest(selectedTicker,monthsOut,target,strategy);
+      _renderWheelBacktestFromResult(result,isAggregate,isStarredMode,selectedTicker,monthsOut,target);
+    }catch(err){
+      console.error('Wheel Backtest computation error:',err);
+      content.innerHTML=`<div class="empty"><div class="empty-icon">&#x26A0;&#xFE0F;</div>Computation error: ${(err&&err.message)||err}<div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:8px;text-align:left;white-space:pre-wrap">${err&&err.stack?err.stack.split('\n').slice(0,4).join('\n'):''}</div></div>`;
     }
-    _renderWheelBacktestFromResult(result,isAggregate,isStarredMode,selectedTicker,monthsOut,target);
   },10);
 }
 
@@ -940,9 +1601,28 @@ function _renderWheelBacktestFromResult(result,isAggregate,isStarredMode,selecte
     <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
       <span style="color:var(--text2)">vs. Buy &amp; Hold (same windows)</span><span style="color:${vsColor}">${result.vsBuyHold>=0?'+':''}${result.vsBuyHold.toFixed(1)}pp avg</span>
     </div>
-    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3);margin-bottom:12px">
-      <span style="color:var(--text2)">Premium source</span><span style="color:var(--warn)">Realized vol + est. term structure</span>
+    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
+      <span style="color:var(--text2)">Win rate</span><span style="color:${result.winRatePct>=50?'var(--green)':'var(--red)'}">${result.winRatePct.toFixed(0)}% of windows</span>
     </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
+      <span style="color:var(--text2)">Beat Buy &amp; Hold</span><span style="color:${result.beatBuyHoldPct>=50?'var(--green)':'var(--red)'}">${result.beatBuyHoldPct.toFixed(0)}% of windows</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
+      <span style="color:var(--text2)">Median excess vs. Buy &amp; Hold</span><span style="color:${result.medianExcessReturn>=0?'var(--green)':'var(--red)'}">${result.medianExcessReturn>=0?'+':''}${result.medianExcessReturn.toFixed(1)}pp</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
+      <span style="color:var(--text2)">Max drawdown, daily modeled (worst &middot; median &middot; best)</span><span style="color:var(--text)">-${result.drawdownEquity.worst.toFixed(1)}% &middot; -${result.drawdownEquity.median.toFixed(1)}% &middot; -${result.drawdownEquity.best.toFixed(1)}%</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
+      <span style="color:var(--text2)">Max cumulative-return pullback (capital-base-relative, not a strict equity drawdown -- worst &middot; median &middot; best)</span><span style="color:var(--text)">-${result.drawdown.worst.toFixed(1)}% &middot; -${result.drawdown.median.toFixed(1)}% &middot; -${result.drawdown.best.toFixed(1)}%</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
+      <span style="color:var(--text2)">Downside deviation</span><span style="color:var(--text)">${result.downsideDeviation.toFixed(1)}%</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;padding:5px 0;border-top:1px solid var(--surface3)">
+      <span style="color:var(--text2)">Premium source</span><span style="color:var(--warn)">Modeled &mdash; realized vol + est. term structure</span>
+    </div>
+    <div style="font-size:9px;color:var(--text3);line-height:1.4;padding-bottom:5px;margin-bottom:12px">Not real historical option quotes. Realized vol runs below implied vol (the volatility risk premium) on average, but not universally -- after a sharp move, trailing realized vol can exceed contemporaneous implied vol, and skew varies by ticker and regime. Modeled premiums may differ materially from tradable historical premiums; the direction and size of the error aren't consistent.</div>
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px">
       <div style="font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px">Example Run${exampleTicker?' ('+exampleTicker+')':''}</div>
       <div style="display:flex;gap:4px">
@@ -1122,10 +1802,15 @@ function renderWheelBacktestRanking(){
   content.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>Computing...</div>';
 
   setTimeout(()=>{
-    const result=_computeWheelBacktestAggregate(watchlist,monthsOut,target,strategy);
-    _wheelbtLastRankingResult=result;
-    _wheelbtLastRankingTarget=target;
-    _renderWheelBacktestRankingFromResult(result,target);
+    try{
+      const result=_computeWheelBacktestAggregate(watchlist,monthsOut,target,strategy);
+      _wheelbtLastRankingResult=result;
+      _wheelbtLastRankingTarget=target;
+      _renderWheelBacktestRankingFromResult(result,target);
+    }catch(err){
+      console.error('Wheel Backtest ranking computation error:',err);
+      content.innerHTML=`<div class="empty"><div class="empty-icon">&#x26A0;&#xFE0F;</div>Computation error: ${(err&&err.message)||err}<div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:8px;text-align:left;white-space:pre-wrap">${err&&err.stack?err.stack.split('\n').slice(0,4).join('\n'):''}</div></div>`;
+    }
   },10);
 }
 
@@ -1168,7 +1853,8 @@ function _renderWheelBacktestRankingFromResult(result,target){
   // Renumbered relative to whatever's actually shown -- when filtered to
   // Starred, "#1" means "your best-ranked starred ticker," not its
   // original rank among the whole watchlist.
-  content.innerHTML=list.map((r,i)=>_wheelBacktestRankingRowHtml(r,i+1,target,starred)).join('');
+  content.innerHTML='<div style="font-size:9px;color:var(--text3);line-height:1.4;padding:0 2px 10px">Modeled from realized volatility, not real historical option quotes -- a rough scenario model, not a live-tradeable backtest. Rankings can shift meaningfully once real option-chain data is used.</div>'
+    +list.map((r,i)=>_wheelBacktestRankingRowHtml(r,i+1,target,starred)).join('');
 }
 
 // ── Coordinator ──────────────────────────────────────────────────────────
@@ -1223,24 +1909,35 @@ function refreshWheelBacktestViews(){
   if(rankingContent)rankingContent.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>Computing...</div>';
 
   setTimeout(()=>{
-    const watchlistResult=_computeWheelBacktestAggregate(watchlist,monthsOut,target,strategy);
-    _wheelbtLastRankingResult=watchlistResult;
-    _wheelbtLastRankingTarget=target;
-    _renderWheelBacktestRankingFromResult(watchlistResult,target);
+    // Wrapped so a genuine bug in the computation surfaces as a visible,
+    // readable error on BOTH cards instead of leaving "Computing..."
+    // frozen forever with no information -- silent hangs are worse than an
+    // ugly error message, since there's nothing to diagnose from a hang.
+    try{
+      const watchlistResult=_computeWheelBacktestAggregate(watchlist,monthsOut,target,strategy);
+      _wheelbtLastRankingResult=watchlistResult;
+      _wheelbtLastRankingTarget=target;
+      _renderWheelBacktestRankingFromResult(watchlistResult,target);
 
-    if(isAggregateScope){
-      _renderWheelBacktestFromResult(watchlistResult,true,false,selectedTicker,monthsOut,target);
-    }else if(isStarredMode){
-      const starredList=watchlist.filter(t=>_starredTickers().has(t));
-      if(!starredList.length){
-        if(mainContent)mainContent.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>No starred tickers yet -- tap the star on a ticker in the Watchlist tab to add one.</div>';
+      if(isAggregateScope){
+        _renderWheelBacktestFromResult(watchlistResult,true,false,selectedTicker,monthsOut,target);
+      }else if(isStarredMode){
+        const starredList=watchlist.filter(t=>_starredTickers().has(t));
+        if(!starredList.length){
+          if(mainContent)mainContent.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>No starred tickers yet -- tap the star on a ticker in the Watchlist tab to add one.</div>';
+        }else{
+          const starredResult=_computeWheelBacktestAggregate(starredList,monthsOut,target,strategy);
+          _renderWheelBacktestFromResult(starredResult,true,true,selectedTicker,monthsOut,target);
+        }
       }else{
-        const starredResult=_computeWheelBacktestAggregate(starredList,monthsOut,target,strategy);
-        _renderWheelBacktestFromResult(starredResult,true,true,selectedTicker,monthsOut,target);
+        const tickerResult=_computeWheelBacktest(selectedTicker,monthsOut,target,strategy);
+        _renderWheelBacktestFromResult(tickerResult,false,false,selectedTicker,monthsOut,target);
       }
-    }else{
-      const tickerResult=_computeWheelBacktest(selectedTicker,monthsOut,target,strategy);
-      _renderWheelBacktestFromResult(tickerResult,false,false,selectedTicker,monthsOut,target);
+    }catch(err){
+      console.error('Wheel Backtest refresh error:',err);
+      const errHtml=`<div class="empty"><div class="empty-icon">&#x26A0;&#xFE0F;</div>Computation error: ${(err&&err.message)||err}<div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:8px;text-align:left;white-space:pre-wrap">${err&&err.stack?err.stack.split('\n').slice(0,4).join('\n'):''}</div></div>`;
+      if(mainContent)mainContent.innerHTML=errHtml;
+      if(rankingContent)rankingContent.innerHTML=errHtml;
     }
     window.scrollTo(0,preservedScrollY);
   },10);

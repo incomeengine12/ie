@@ -188,7 +188,7 @@ const L3_TEXT   = '#00d4aa';
 
 function _defaultIncomeInputs(){
   // targetAPY defaults to global dashboard value if set, else 12
-  const globalAPY = parseFloat(document.getElementById('target-apy')?.value) || 12;
+  const globalAPY = finiteNumber(document.getElementById('target-apy')?.value,{min:0,max:500,fallback:12});
   return{
     tbillAmt:0, fdlxxAmt:0, spaxxAmt:0,
     spyiShares:0, nbosShares:0,
@@ -216,7 +216,7 @@ function _saveIncomeInputs(){
     nbosShares:  _numVal('inc-nbos-shares'),
     putsNotional:_numVal('inc-puts-notional'),
     ccStockAmt:  _numVal('inc-cc-stock-amt'),
-    targetAPY:   parseFloat(document.getElementById('inc-target-apy')?.value) || 12,
+    targetAPY:   finiteNumber(document.getElementById('inc-target-apy')?.value,{min:0,max:500,fallback:12}),
     // Preserve manual yield overrides and toggle states
     fdlxxYieldManual:existing.fdlxxYieldManual??null,
     spaxxYieldManual:existing.spaxxYieldManual??null,
@@ -247,7 +247,12 @@ function _saveManualYields(){
 
 function _numVal(id){
   const el=document.getElementById(id);
-  return el?Math.max(0,parseFloat(el.value.replace(/,/g,''))||0):0;
+  if(!el)return 0;
+  // A billion-dollar cap: generous enough to never constrain a real
+  // personal account, tight enough to catch an accidental extra zero,
+  // a corrupted paste, or Infinity (which `||0` doesn't catch, since
+  // Infinity is truthy).
+  return finiteNumber(el.value.replace(/,/g,''),{min:0,max:1e9,fallback:0});
 }
 
 function _fillInputs(inp){
@@ -453,12 +458,30 @@ function _calcIncome(inp,tbillYield,fdlxxYield,spaxxYield,spyiData,nbosData,targ
   const blendedYield =totalCapital>0?totalIncome/totalCapital*100:0;
   const l3Lift       =totalCapital>0?l3Income/totalCapital*100:0;
 
+  // Collateral-coverage check: the exclusion above is only correct if the
+  // cash securing every tracked put is ACTUALLY sitting in Layer 1. If
+  // tracked put notional exceeds Layer 1's own capital, that assumption
+  // has broken down somewhere (margin in use, a real cash balance not
+  // fully reflected in Layer 1's tracked accounts, etc.) -- the blended
+  // yield above is then implicitly a return on leveraged capital, not
+  // fully-covered cash-secured capital, without saying so anywhere. This
+  // doesn't change the arithmetic (still the same exclusion, same
+  // formula) -- it only flags when that exclusion's own precondition
+  // isn't actually holding, so the person can see it rather than trust a
+  // number that's quietly assuming more collateral exists than is shown.
+  const collateralCoverage={
+    putsNotional:_effectivePutsNotional,l1Capital,
+    covered:_effectivePutsNotional<=l1Capital,
+    shortfall:Math.max(0,_effectivePutsNotional-l1Capital),
+  };
+
   return{
     l1:{capital:l1Capital,income:l1Income,yield:l1Yield,components:l1Components},
     l2:{capital:l2Capital,income:l2Income,yield:l2Yield,components:l2Components},
     l3:{income:l3Income,lift:l3Lift,components:l3Components,targetAPY},
     blended:{yield:blendedYield,capital:totalCapital,annualIncome:totalIncome,monthlyIncome:totalIncome/12},
     yields:{tbill:tbillYield,tbillTEY,fdlxx:fdlxxYield,fdlxxTEY,spaxx:spaxxYield},
+    collateralCoverage,
   };
 }
 
@@ -563,6 +586,22 @@ function _layerCard({bg,border,accentColor,title,layerNum,capitalStr,yieldStr,in
   +'</div>';
 }
 
+// Warning banner shown when tracked put notional exceeds Layer 1's own
+// capital -- the blended yield's exclusion of put collateral from the
+// denominator (see _calcIncome) is only correct when that collateral is
+// actually sitting in Layer 1; if it isn't, the displayed yield is
+// implicitly a return on leveraged capital, not fully cash-secured
+// capital, without saying so anywhere else in the UI. Returns '' when
+// coverage is fine (the common case) -- nothing shown, no clutter.
+function _collateralCoverageWarningHtml(cc){
+  if(!cc||cc.covered)return'';
+  return '<div style="background:rgba(255,159,10,0.12);border:1px solid var(--warn);border-radius:var(--radius);padding:10px 12px;margin-bottom:12px;font-family:var(--mono);font-size:11px;color:var(--text)">'
+    +'<div style="font-weight:600;color:var(--warn);margin-bottom:3px">&#x26A0; Collateral coverage shortfall</div>'
+    +'<div>Tracked put notional ('+_fmtDollar(cc.putsNotional)+') exceeds Layer 1 capital ('+_fmtDollar(cc.l1Capital)+') by '+_fmtDollar(cc.shortfall)+'. '
+    +'The blended yield above assumes put collateral is already covered by Layer 1 cash and excludes it from the denominator -- if that\'s not actually the case (margin in use, or real cash not fully reflected in Layer 1 here), this yield is effectively a return on leveraged capital, not fully cash-secured capital.</div>'
+  +'</div>';
+}
+
 function _renderResults(result,mmfTs,mmfFromCache,mmfMeta,rawFetched){
   const{l1,l2,l3,blended}=result;
   const noCapital=blended.capital<=0;
@@ -586,7 +625,8 @@ function _renderResults(result,mmfTs,mmfFromCache,mmfMeta,rawFetched){
       +'</div>'
       +(l3.income>0?'<div style="font-family:var(--mono);font-size:10px;color:'+L3_TEXT+';margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">Options overlay adds +'+_fmtPct(l3.lift)+' lift on total capital ('+_fmtDollar(l3.income)+'/yr in premium income)</div>':'')
     )
-  +'</div>';
+  +'</div>'
+  +_collateralCoverageWarningHtml(result.collateralCoverage);
 
   // ── Layer 1 with manual fallbacks ─────────────────────────────────────────
   const l1ComponentsWithFallback=l1.components.map(c=>{
@@ -769,6 +809,12 @@ function refreshIncomeYields(){
 // Modal state: track which account a modal was opened for (race condition guard)
 let _pendingModalAccountId = null;
 let _modalOpen = false; // true while any income modal is open -- blocks account switching
+// Set by _selectRollCandidate right before opening the add-position modal;
+// read by _openAddPositionModal/_openAddCCModal to show the extra "mark
+// original as rolled" checkbox, and by _confirmAddPosition/_confirmAddCC to
+// perform the atomic old-position-update + new-position-push. Cleared on
+// modal close so a subsequent NORMAL "Add Position" doesn't inherit it.
+let _pendingRollFrom = null;
 
 function _setModalOpen(open){
   _modalOpen = open;
@@ -836,14 +882,30 @@ function _renderAccountSwitcher(){
     const activeStyle = isActive
       ? `background:${color}22;border-color:${color};color:${color};font-weight:500;`
       : 'background:var(--surface2);border:1px solid var(--border);color:var(--text2);';
+    // a.id is always app-generated (_genAcctId: 'acct_'+timestamp+'_'+random)
+    // in normal use, but a tampered backup import could smuggle something
+    // else in -- validated here before it goes anywhere near an inline
+    // onclick string, since _escHtml alone doesn't prevent breaking out of
+    // a JS string literal embedded in an HTML attribute (the browser
+    // HTML-decodes the attribute value before the JS engine parses it as
+    // code, so an escaped quote there still becomes a real quote by the
+    // time it matters). Falls back to a version with no click handler at
+    // all rather than ever emitting an unsafe one.
+    const safeId=/^acct_[A-Za-z0-9_]{1,40}$/.test(a.id)?a.id:null;
+    const clickAttrs=safeId
+      ?`onclick="_switchAccount('${safeId}')"`
+      :'';
+    const renameClickAttrs=safeId
+      ?`onclick="event.stopPropagation();_openRenameAccountModal('${safeId}')"`
+      :'';
     return `<div class="acct-chip${isActive?' active':''}" ` +
       `style="display:inline-flex;align-items:center;flex-shrink:0;white-space:nowrap;gap:5px;` +
       `font-family:var(--mono);font-size:11px;padding:5px 10px;border-radius:6px;` +
       `border:1px solid;transition:all 0.2s;user-select:none;-webkit-user-select:none;` +
       `${activeStyle}">` +
-      `<span style="cursor:pointer" onclick="_switchAccount('${a.id}')">${a.name}</span>` +
+      `<span style="cursor:pointer" ${clickAttrs}>${_escHtml(a.name)}</span>` +
       `<span style="cursor:pointer;font-size:9px;opacity:0.6;line-height:1;padding-left:2px" ` +
-        `onclick="event.stopPropagation();_openRenameAccountModal('${a.id}')">✎</span>` +
+        `${renameClickAttrs}>✎</span>` +
       `</div>`;
   }).join('');
 
@@ -932,15 +994,16 @@ function _openRenameAccountModal(id){
     el.id = 'income-acct-rename-modal';
     document.body.appendChild(el);
   }
+  const safeId=/^acct_[A-Za-z0-9_]{1,40}$/.test(id)?id:null;
   el.innerHTML =
     '<div class="modal-box" style="max-height:80vh;overflow-y:auto">' +
       '<div class="modal-title modal-title-neutral">Rename Account</div>' +
-      '<div class="modal-body">Current name: <strong>' + acct.name + '</strong></div>' +
-      '<input class="input" id="rename-acct-inp" value="' + acct.name + '" maxlength="30" style="margin-bottom:8px">' +
+      '<div class="modal-body">Current name: <strong>' + _escHtml(acct.name) + '</strong></div>' +
+      '<input class="input" id="rename-acct-inp" value="' + _escHtml(acct.name) + '" maxlength="30" style="margin-bottom:8px">' +
       '<div style="display:flex;gap:8px;margin-top:8px">' +
         '<button class="btn btn-secondary btn-sm" onclick="_closeRenameAccountModal()">Cancel</button>' +
         '<button class="btn btn-primary btn-sm" onclick="_confirmRenameAccount()">Rename</button>' +
-        '<button class="btn btn-danger btn-sm" onclick="_openDeleteAccountModal(\'' + id + '\')">Delete…</button>' +
+        (safeId?'<button class="btn btn-danger btn-sm" onclick="_openDeleteAccountModal(\''+safeId+'\')">Delete…</button>':'') +
       '</div>' +
     '</div>';
   el.classList.add('open');
@@ -1006,11 +1069,11 @@ function _openDeleteAccountModal(id){
 
   el.innerHTML =
     '<div class="modal-box" style="max-height:80vh;overflow-y:auto">' +
-      '<div class="modal-title">Delete "' + acct.name + '"?</div>' +
+      '<div class="modal-title">Delete "' + _escHtml(acct.name) + '"?</div>' +
       '<div class="modal-body">This permanently deletes this account and all its data. This cannot be undone.</div>' +
       posWarning +
-      '<div style="font-family:var(--mono);font-size:11px;color:var(--text2);margin-bottom:6px">Type <strong>' + acct.name.toUpperCase() + '</strong> to confirm:</div>' +
-      '<input class="input" id="delete-acct-confirm-inp" placeholder="' + acct.name.toUpperCase() + '" style="margin-bottom:12px" autocomplete="off">' +
+      '<div style="font-family:var(--mono);font-size:11px;color:var(--text2);margin-bottom:6px">Type <strong>' + _escHtml(acct.name.toUpperCase()) + '</strong> to confirm:</div>' +
+      '<input class="input" id="delete-acct-confirm-inp" placeholder="' + _escHtml(acct.name.toUpperCase()) + '" style="margin-bottom:12px" autocomplete="off">' +
       '<div style="display:flex;gap:8px">' +
         '<button class="btn btn-secondary btn-sm" onclick="_closeDeleteAccountModal()">Cancel</button>' +
         '<button class="btn btn-danger btn-sm" id="delete-acct-confirm-btn" disabled onclick="_confirmDeleteAccount()">Delete</button>' +
@@ -1117,7 +1180,7 @@ function _calcIncomeForAccount(accountId){
 // per-account card already uses.
 function _calcIncomeAllAccounts(){
   const accounts=_getAccounts();
-  let l1Capital=0,l1Income=0,l2Capital=0,l2Income=0,l3Income=0,totalCapital=0,totalIncome=0;
+  let l1Capital=0,l1Income=0,l2Capital=0,l2Income=0,l3Income=0,totalCapital=0,totalIncome=0,putsNotionalAll=0;
   accounts.forEach(a=>{
     const r=_calcIncomeForAccount(a.id);
     l1Capital+=r.l1.capital; l1Income+=r.l1.income;
@@ -1125,6 +1188,7 @@ function _calcIncomeAllAccounts(){
     l3Income+=r.l3.income;
     totalCapital+=r.blended.capital;
     totalIncome+=r.blended.annualIncome;
+    putsNotionalAll+=r.collateralCoverage.putsNotional;
   });
   const blendedYield=totalCapital>0?totalIncome/totalCapital*100:0;
   const l3Lift=totalCapital>0?l3Income/totalCapital*100:0;
@@ -1134,6 +1198,7 @@ function _calcIncomeAllAccounts(){
     l2:{capital:l2Capital,income:l2Income},
     l3:{income:l3Income,lift:l3Lift},
     blended:{yield:blendedYield,capital:totalCapital,annualIncome:totalIncome,monthlyIncome:totalIncome/12},
+    collateralCoverage:{putsNotional:putsNotionalAll,l1Capital,covered:putsNotionalAll<=l1Capital,shortfall:Math.max(0,putsNotionalAll-l1Capital)},
   };
 }
 
@@ -1157,7 +1222,8 @@ function _renderAllAccountsHero(result){
       +'</div>'
       +(l3.income>0?'<div style="font-family:var(--mono);font-size:10px;color:'+L3_TEXT+';margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">Options overlay adds +'+_fmtPct(l3.lift)+' lift on total capital ('+_fmtDollar(l3.income)+'/yr in premium income)</div>':'')
     )
-    +'</div>';
+    +'</div>'
+    +_collateralCoverageWarningHtml(result.collateralCoverage);
 }
 
 function openIncomeOverview(){
@@ -1230,9 +1296,10 @@ function openIncomeOverview(){
     }
 
     const isActive = a.id === _activeAccountId;
-    return `<div style="background:${isActive?'var(--surface2)':'var(--surface)'};border:1px solid var(--border);border-left:3px solid ${color};border-radius:8px;padding:12px;margin-bottom:8px;cursor:pointer" onclick="_switchFromOverview('${a.id}')">` +
+    const safeOverviewId=/^acct_[A-Za-z0-9_]{1,40}$/.test(a.id)?a.id:null;
+    return `<div style="background:${isActive?'var(--surface2)':'var(--surface)'};border:1px solid var(--border);border-left:3px solid ${color};border-radius:8px;padding:12px;margin-bottom:8px;cursor:pointer" ${safeOverviewId?`onclick="_switchFromOverview('${safeOverviewId}')"`:''}>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">` +
-        `<div style="font-family:var(--sans);font-size:13px;font-weight:700;color:${color}">${a.name}${isActive?' <span style="font-size:9px;color:var(--text3)">(active)</span>':''}</div>` +
+        `<div style="font-family:var(--sans);font-size:13px;font-weight:700;color:${color}">${_escHtml(a.name)}${isActive?' <span style="font-size:9px;color:var(--text3)">(active)</span>':''}</div>` +
         `<div style="font-family:var(--mono);font-size:10px;color:${urgencyColor}">${urgencyLabel}</div>` +
       `</div>` +
       `<div style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.8">` +
@@ -1372,6 +1439,18 @@ function _posExpiryStatus(pos){
   // Returns: 'active' | 'expiring-soon' | 'expiring-imminent' | 'expired-linger' | 'remove'
   const today = new Date();
   today.setHours(0,0,0,0);
+  // A manually-rolled position (pos.rolledAt set) enters the SAME
+  // linger-then-remove lifecycle as a naturally expired one, just timed from
+  // the roll date instead of pos.expDate -- every notional/income
+  // calculation already excludes 'expired-linger'/'remove', so a rolled
+  // position is automatically excluded too, with no separate exclusion
+  // logic needed anywhere else in the file.
+  if(pos.rolledAt){
+    const rolled = new Date(pos.rolledAt);
+    rolled.setHours(0,0,0,0);
+    const daysSinceRolled = Math.round((today - rolled) / 86400000);
+    return daysSinceRolled > POS_LINGER_DAYS ? 'remove' : 'expired-linger';
+  }
   const exp = new Date(pos.expDate + 'T12:00:00Z');
   const daysUntil = Math.round((exp - today) / 86400000);
   if(daysUntil < -POS_LINGER_DAYS) return 'remove';
@@ -1519,7 +1598,7 @@ function _rollCandidatesSectionHtml(pos, isCall, kind){
       if(!c) return '<td style="text-align:right;padding:5px 4px;border-bottom:1px solid var(--surface3)"><span style="color:var(--text3);font-size:10px">--</span></td>';
       const meetsTarget = c.annualizedPct >= targetAPY;
       const color = meetsTarget ? 'var(--green)' : 'var(--text2)';
-      return '<td style="text-align:right;padding:5px 4px;border-bottom:1px solid var(--surface3)">' +
+      return '<td onclick="_selectRollCandidate(\''+pos.id+'\',\''+kind+'\','+s+',\''+exp+'\')" style="text-align:right;padding:5px 4px;border-bottom:1px solid var(--surface3);cursor:pointer" title="Roll into this strike/expiry">' +
         '<div style="color:var(--text3);font-size:9px">net '+_fmtDollar(c.netCredit)+'</div>' +
         '<div style="color:'+color+';font-size:11px;'+(meetsTarget?'font-weight:600':'')+'">'+c.annualizedPct.toFixed(1)+'%</div>' +
       '</td>';
@@ -1533,7 +1612,7 @@ function _rollCandidatesSectionHtml(pos, isCall, kind){
     '</div>' +
     '<div class="gs-body" id="roll-body-'+uid+'">' +
       '<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin-top:2px">'+header+rows+'</table>' +
-      '<div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:6px;line-height:1.5">Green = meets or beats target APY ('+_fmtPct(targetAPY)+') &middot; net = new credit minus cost to close &middot; strikes range from your current strike out to the first strike showing a net debit &middot; expiries limited to what\'s already cached</div>' +
+      '<div style="font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:6px;line-height:1.5">Green = meets or beats target APY ('+_fmtPct(targetAPY)+') &middot; net = new credit minus cost to close &middot; strikes range from your current strike out to the first strike showing a net debit &middot; expiries limited to what\'s already cached &middot; tap a cell to roll into it</div>' +
     '</div>';
 }
 
@@ -1544,6 +1623,49 @@ function toggleRollCandidates(uid){
   const isOpen=body.classList.contains('open');
   body.classList.toggle('open',!isOpen);
   chev.classList.toggle('open',!isOpen);
+}
+
+// Opens the same Add Put / Add CC modal a fresh "Add Position" tap would,
+// but pre-filled with a roll candidate's ticker/expiry/strike, contracts
+// carried over from the original position, and (for a call) the current
+// price already auto-filled by the normal ticker-change handler. Reuses
+// the REAL onchange handlers (_onPosTickerChange etc.) to populate the
+// expiry/strike dropdowns, rather than reimplementing that cascade here,
+// so this can never drift out of sync with how the modal behaves normally.
+function _selectRollCandidate(posId,kind,strike,exp){
+  const isPut=kind==='put';
+  const positions=isPut?_loadPositions():_loadCCPositions();
+  const pos=positions.find(p=>p.id===posId);
+  if(!pos){toast('Original position not found');return;}
+
+  _pendingRollFrom={
+    posId,kind,
+    origTicker:pos.ticker,
+    origStrikeLabel:'$'+(pos.strike%1===0?pos.strike.toFixed(0):pos.strike.toFixed(2)),
+    origExpDate:pos.expDate,
+  };
+
+  if(isPut){
+    _openAddPositionModal();
+    const tickerSel=document.getElementById('pos-ticker-sel');
+    if(tickerSel){tickerSel.value=pos.ticker;_onPosTickerChange();}
+    const expSel=document.getElementById('pos-exp-sel');
+    if(expSel){expSel.value=exp;_onPosExpChange();}
+    const strikeSel=document.getElementById('pos-strike-sel');
+    if(strikeSel)strikeSel.value=String(strike);
+    const contractsEl=document.getElementById('pos-contracts');
+    if(contractsEl)contractsEl.value=pos.contracts;
+  }else{
+    _openAddCCModal();
+    const tickerSel=document.getElementById('cc-ticker-sel');
+    if(tickerSel){tickerSel.value=pos.ticker;_onCCTickerChange();} // also auto-fills current stock price, same as a normal Add CC
+    const expSel=document.getElementById('cc-exp-sel');
+    if(expSel){expSel.value=exp;_onCCExpChange();}
+    const strikeSel=document.getElementById('cc-strike-sel');
+    if(strikeSel)strikeSel.value=String(strike);
+    const contractsEl=document.getElementById('cc-contracts');
+    if(contractsEl)contractsEl.value=pos.contracts;
+  }
 }
 
 function _getPosPricing(pos, isCall){
@@ -1676,6 +1798,12 @@ function _openAddPositionModal(){
       '<div id="pos-no-data-warn" style="font-family:var(--mono);font-size:10px;color:var(--warn);display:none;margin-bottom:10px">' +
         '&#x26A0; No cached options for this ticker. Visit the Options tab to load data first.' +
       '</div>' +
+      (_pendingRollFrom?.kind==='put'?(
+        '<div class="input-group" style="margin-bottom:14px;display:flex;align-items:flex-start;gap:8px">' +
+          '<input type="checkbox" id="pos-mark-rolled" checked style="margin-top:3px">' +
+          '<label for="pos-mark-rolled" style="font-family:var(--mono);font-size:10px;color:var(--text2)">Mark '+_pendingRollFrom.origTicker+' '+_pendingRollFrom.origStrikeLabel+' exp '+_pendingRollFrom.origExpDate+' as rolled (no longer tracked)</label>' +
+        '</div>'
+      ):'') +
       '<div style="display:flex;gap:8px">' +
         '<button class="btn btn-secondary btn-sm" onclick="_closePosModal()">Cancel</button>' +
         '<button class="btn btn-primary btn-sm" onclick="_confirmAddPosition()">Add Position</button>' +
@@ -1689,6 +1817,7 @@ function _closePosModal(){
   const el = document.getElementById('pos-add-modal');
   if(el) el.classList.remove('open');
   _pendingModalAccountId = null;
+  _pendingRollFrom = null;
   _setModalOpen(false);
 }
 
@@ -1771,7 +1900,7 @@ function _confirmAddPosition(){
   const ticker   = document.getElementById('pos-ticker-sel')?.value;
   const expDate  = document.getElementById('pos-exp-sel')?.value;
   const strike   = parseFloat(document.getElementById('pos-strike-sel')?.value);
-  const contracts= Math.max(1, parseInt(document.getElementById('pos-contracts')?.value)||1);
+  const contracts= Math.round(finiteNumber(document.getElementById('pos-contracts')?.value,{min:1,max:10000,fallback:1}));
 
   if(!ticker || !expDate || !strike){
     toast('Please select ticker, expiration and strike');
@@ -1786,11 +1915,25 @@ function _confirmAddPosition(){
   const posKey = _acctKeyFor(targetAcctId, 'put_positions');
   const positions = S.get(posKey) || [];
   const id = 'pos_' + Date.now();
+
+  // If this modal was opened by tapping a roll candidate, atomically mark
+  // the original position as rolled -- same array, same save call as the
+  // new position below, so this never leaves a state where one saved and
+  // the other didn't. Account switching is blocked while any income modal
+  // is open (_modalOpen), so the original position is guaranteed to still
+  // be in THIS same account's array.
+  const rollFrom = _pendingRollFrom;
+  const markRolled = rollFrom?.kind==='put' && document.getElementById('pos-mark-rolled')?.checked;
+  if(markRolled){
+    const origIdx = positions.findIndex(p => p.id === rollFrom.posId);
+    if(origIdx >= 0) positions[origIdx] = {...positions[origIdx], rolledAt: new Date().toISOString()};
+  }
+
   positions.push({id, ticker, strike, expDate, contracts, addedTs: new Date().toISOString()});
   S.set(posKey, positions);
   _closePosModal();
   recalcIncome();
-  toast('Position added: ' + ticker + ' $' + (strike%1===0?strike.toFixed(0):strike.toFixed(2)) + ' x' + contracts);
+  toast('Position added: ' + ticker + ' $' + (strike%1===0?strike.toFixed(0):strike.toFixed(2)) + ' x' + contracts + (markRolled?' (original marked rolled)':''));
 }
 
 let _pendingRemovePosId = null;
@@ -1879,6 +2022,7 @@ function _renderPositionList(){
     ? '<button class="btn btn-secondary" style="font-size:10px;padding:4px 10px;margin-top:6px" onclick="_clearExpiredPositions()">Clear Expired</button>'
     : '';
 
+  let _posListMutated = false;
   const rows = sorted.map(pos => {
     const status = _posExpiryStatus(pos);
     const ss = STATUS_STYLE[status];
@@ -1887,11 +2031,42 @@ function _renderPositionList(){
     const today = new Date(); today.setHours(0,0,0,0);
     const exp = new Date(pos.expDate + 'T12:00:00Z');
     const daysUntil = Math.round((exp - today) / 86400000);
-    const daysStr = expired
-      ? 'Expired ' + Math.abs(daysUntil) + 'd ago'
-      : daysUntil === 0 ? 'Expires today' : 'Exp in ' + daysUntil + 'd';
+    // True the moment market close has actually passed on the position's
+    // own expiration day -- distinct from the calendar-date-only 'expired'
+    // status above, which doesn't flip until the NEXT day. Without this,
+    // a position that closed worthless (or ITM) hours ago still read as
+    // "Expires today", present tense, for the rest of the day.
+    const closedToday = !pos.rolledAt && pos.expDate === _todayET() &&
+      Date.now() >= (_todayReportBoundaryEpoch('amc') || Infinity);
+    // Worthless/ITM at expiration is captured ONCE, the first render after
+    // it actually closes, and frozen on the position from then on --
+    // deliberately NOT recomputed live on every render, since the stock's
+    // price can drift back and forth across the strike during the 7-day
+    // linger window and would otherwise flip the celebration on and off
+    // misleadingly. _getPosPricing's live itm check is suppressed once
+    // 'expired-linger' (see below), so this has to run at the one moment
+    // it's still available: closedToday, or the position's very first
+    // render after crossing into expired-linger with nothing captured yet.
+    const needsWorthlessCapture = !pos.rolledAt && pos.expiredWorthless === undefined && (closedToday || expired);
+    // A manually-rolled position shares the same visual treatment as a
+    // naturally expired one (same status, same graying), but the label and
+    // "days ago" figure should reflect the roll, not the real (possibly
+    // still-future) expiration date -- otherwise it would misleadingly
+    // read "Expired" on a position that hasn't actually expired.
+    const rolledLabel = pos.rolledAt ? 'Rolled' : ss.label;
+    const daysStr = pos.rolledAt
+      ? 'Rolled ' + Math.max(0, Math.round((today - new Date(pos.rolledAt)) / 86400000)) + 'd ago'
+      : expired
+        ? 'Expired ' + Math.abs(daysUntil) + 'd ago'
+        : closedToday ? 'Expired today'
+        : daysUntil === 0 ? 'Expires today' : 'Exp in ' + daysUntil + 'd';
 
-    const pricing = expired ? { currentPrice: null, itm: null, timeValue: null } : _getPosPricing(pos);
+    const pricing = (expired && !needsWorthlessCapture) ? { currentPrice: null, itm: null, timeValue: null } : _getPosPricing(pos);
+    if(needsWorthlessCapture){
+      pos.expiredWorthless = !pricing.itm;
+      _posListMutated = true;
+    }
+    const celebrateTag = pos.expiredWorthless === true ? ' <span title="Expired worthless">&#x1F389;</span>' : '';
     const priceStr = pricing.currentPrice != null ? ' · now $' + pricing.currentPrice.toFixed(2) : '';
     const itmTag = pricing.itm
       ? '<span style="color:var(--red)">&#x26A0; ITM</span>'
@@ -1907,7 +2082,8 @@ function _renderPositionList(){
       '<div>' +
         '<div style="font-family:var(--mono);font-size:13px;font-weight:700;color:'+(expired?'var(--text3)':'var(--accent)')+'">'+
           pos.ticker+' $'+(pos.strike%1===0?pos.strike.toFixed(0):pos.strike.toFixed(2))+
-          (ss.label?'<span style="font-size:9px;color:'+ss.labelColor+';margin-left:6px;font-weight:400">'+ss.label+'</span>':'')+
+          (rolledLabel?'<span style="font-size:9px;color:'+ss.labelColor+';margin-left:6px;font-weight:400">'+rolledLabel+'</span>':'')+
+          celebrateTag+
           (itmTag&&!expired?' <span style="font-size:9px;margin-left:4px">'+itmTag+'</span>':'')+
           ' <span onclick="event.stopPropagation();navigateToTicker(\''+pos.ticker+'\')" style="font-size:10px;color:var(--accent3);cursor:pointer;margin-left:4px" title="Go to Ticker tab">&#8599;</span>'+
         '</div>'+
@@ -1925,6 +2101,7 @@ function _renderPositionList(){
       (expired?'':_rollCandidatesSectionHtml(pos,false,'put'))+
     '</div>';
   }).join('');
+  if(_posListMutated) _savePositions(keep);
 
   const emptyMsg = keep.length === 0
     ? '<div style="font-family:var(--mono);font-size:11px;color:var(--text3);text-align:center;padding:12px 0">No positions entered. Tap Add Position to begin.</div>'
@@ -2080,6 +2257,12 @@ function _openAddCCModal(){
       '<div id="cc-no-data-warn" style="font-family:var(--mono);font-size:10px;color:var(--warn);display:none;margin-bottom:10px">' +
         '&#x26A0; No cached options for this ticker. Visit the Options tab to load data first.' +
       '</div>' +
+      (_pendingRollFrom?.kind==='cc'?(
+        '<div class="input-group" style="margin-bottom:14px;display:flex;align-items:flex-start;gap:8px">' +
+          '<input type="checkbox" id="cc-mark-rolled" checked style="margin-top:3px">' +
+          '<label for="cc-mark-rolled" style="font-family:var(--mono);font-size:10px;color:var(--text2)">Mark '+_pendingRollFrom.origTicker+' '+_pendingRollFrom.origStrikeLabel+' exp '+_pendingRollFrom.origExpDate+' as rolled (no longer tracked)</label>' +
+        '</div>'
+      ):'') +
       '<div style="display:flex;gap:8px">' +
         '<button class="btn btn-secondary btn-sm" onclick="_closeAddCCModal()">Cancel</button>' +
         '<button class="btn btn-primary btn-sm" onclick="_confirmAddCC()">Add Position</button>' +
@@ -2092,6 +2275,7 @@ function _openAddCCModal(){
 function _closeAddCCModal(){
   const el = document.getElementById('cc-add-modal');
   if(el) el.classList.remove('open');
+  _pendingRollFrom = null;
   _pendingModalAccountId = null;
   _setModalOpen(false);
 }
@@ -2158,7 +2342,7 @@ function _confirmAddCC(){
   const ticker          = document.getElementById('cc-ticker-sel')?.value;
   const expDate         = document.getElementById('cc-exp-sel')?.value;
   const strike          = parseFloat(document.getElementById('cc-strike-sel')?.value);
-  const contracts       = Math.max(1, parseInt(document.getElementById('cc-contracts')?.value)||1);
+  const contracts       = Math.round(finiteNumber(document.getElementById('cc-contracts')?.value,{min:1,max:10000,fallback:1}));
   const stockPriceAtWrite = parseFloat(document.getElementById('cc-stock-price-at-write')?.value);
 
   if(!ticker||!expDate||!strike){
@@ -2177,11 +2361,20 @@ function _confirmAddCC(){
   const ccKey = _acctKeyFor(targetAcctId, 'cc_positions');
   const positions = S.get(ccKey) || [];
   const id = 'cc_' + Date.now();
+
+  // Same atomic roll handling as _confirmAddPosition -- see its comment.
+  const rollFrom = _pendingRollFrom;
+  const markRolled = rollFrom?.kind==='cc' && document.getElementById('cc-mark-rolled')?.checked;
+  if(markRolled){
+    const origIdx = positions.findIndex(p => p.id === rollFrom.posId);
+    if(origIdx >= 0) positions[origIdx] = {...positions[origIdx], rolledAt: new Date().toISOString()};
+  }
+
   positions.push({id, ticker, strike, expDate, contracts, stockPriceAtWrite, addedTs: new Date().toISOString()});
   S.set(ccKey, positions);
   _closeAddCCModal();
   recalcIncome();
-  toast('CC position added: ' + ticker + ' $' + (strike%1===0?strike.toFixed(0):strike.toFixed(2)) + ' call x' + contracts);
+  toast('CC position added: ' + ticker + ' $' + (strike%1===0?strike.toFixed(0):strike.toFixed(2)) + ' call x' + contracts + (markRolled?' (original marked rolled)':''));
 }
 
 let _pendingRemoveCCId = null;
@@ -2268,6 +2461,7 @@ function _renderCCPositionList(){
 
   const sorted = _sortCCPositions(keep);
 
+  let _posListMutated = false;
   const rows = sorted.map(pos => {
     const status = _posExpiryStatus(pos);
     const ss = STATUS_STYLE[status];
@@ -2276,9 +2470,19 @@ function _renderCCPositionList(){
     const today = new Date(); today.setHours(0,0,0,0);
     const exp = new Date(pos.expDate+'T12:00:00Z');
     const daysUntil = Math.round((exp-today)/86400000);
-    const daysStr = expired
-      ? 'Expired '+Math.abs(daysUntil)+'d ago'
-      : daysUntil===0?'Expires today':'Exp in '+daysUntil+'d';
+    // See the put-position renderer's matching comment for why this and
+    // the worthless-capture below exist as a separate, time-of-day-aware
+    // check rather than relying on the calendar-date-only 'expired' status.
+    const closedToday = !pos.rolledAt && pos.expDate===_todayET() &&
+      Date.now() >= (_todayReportBoundaryEpoch('amc')||Infinity);
+    const needsWorthlessCapture = !pos.rolledAt && pos.expiredWorthless===undefined && (closedToday||expired);
+    const daysStr = pos.rolledAt
+      ? 'Rolled '+Math.max(0,Math.round((today-new Date(pos.rolledAt))/86400000))+'d ago'
+      : expired
+        ? 'Expired '+Math.abs(daysUntil)+'d ago'
+        : closedToday ? 'Expired today'
+        : daysUntil===0?'Expires today':'Exp in '+daysUntil+'d';
+    const rolledLabel = pos.rolledAt ? 'Rolled' : ss.label;
     const snap = S.get('snap_'+pos.ticker);
     const currentPrice = snap?.price||null;
     const priceDiff = currentPrice&&pos.stockPriceAtWrite
@@ -2287,7 +2491,12 @@ function _renderCCPositionList(){
     const nearStrike = currentPrice&&pos.strike
       ? ((pos.strike-currentPrice)/currentPrice*100)
       : null;
-    const pricing = expired ? { itm: null, timeValue: null } : _getPosPricing(pos, true);
+    const pricing = (expired && !needsWorthlessCapture) ? { itm: null, timeValue: null } : _getPosPricing(pos, true);
+    if(needsWorthlessCapture){
+      pos.expiredWorthless = !pricing.itm;
+      _posListMutated = true;
+    }
+    const celebrateTag = pos.expiredWorthless===true ? ' <span title="Expired worthless">&#x1F389;</span>' : '';
     const timeValueLine = pricing.timeValue != null
       ? '<div style="font-family:var(--mono);font-size:9px;color:'+(pricing.itm?'var(--warn)':'var(--text3)')+'">'+
           'Time value: '+_fmtDollar(pricing.timeValue)+(pos.contracts>1?' ('+_fmtDollar(pricing.timeValue/pos.contracts)+'/contract)':'')+(pricing.itm?' remaining &mdash; consider rolling':'')+
@@ -2299,7 +2508,8 @@ function _renderCCPositionList(){
         '<div style="flex:1">' +
           '<div style="font-family:var(--mono);font-size:13px;font-weight:700;color:'+(expired?'var(--text3)':L2_TEXT)+'">'+
             pos.ticker+' $'+(pos.strike%1===0?pos.strike.toFixed(0):pos.strike.toFixed(2))+' call'+
-            (ss.label?'<span style="font-size:9px;color:'+ss.labelColor+';margin-left:6px;font-weight:400">'+ss.label+'</span>':'')+
+            (rolledLabel?'<span style="font-size:9px;color:'+ss.labelColor+';margin-left:6px;font-weight:400">'+rolledLabel+'</span>':'')+
+            celebrateTag+
             ' <span onclick="event.stopPropagation();navigateToTicker(\''+pos.ticker+'\')" style="font-size:10px;color:var(--accent3);cursor:pointer;margin-left:4px" title="Go to Ticker tab">&#8599;</span>'+
           '</div>'+
           '<div style="font-family:var(--mono);font-size:10px;color:var(--text3)">'+
@@ -2324,6 +2534,7 @@ function _renderCCPositionList(){
       (expired?'':_rollCandidatesSectionHtml(pos,true,'cc'))+
     '</div>';
   }).join('');
+  if(_posListMutated) _saveCCPositions(keep);
 
   const emptyMsg = keep.length===0
     ? '<div style="font-family:var(--mono);font-size:11px;color:var(--text3);text-align:center;padding:12px 0">No CC positions entered. Tap Add CC Position to begin.</div>'
@@ -2377,7 +2588,15 @@ function _computeAssignmentRisk(){
   const processPos=(pos,isCall,acct)=>{
     try{
       const status=_posExpiryStatus(pos);
-      if(status==='remove')return; // past the lingering window, not relevant anymore
+      // Exclude BOTH 'remove' and 'expired-linger' -- matching the same
+      // convention already used everywhere else in this file (notional
+      // totals, the active-position lists). A freshly-rolled position
+      // enters 'expired-linger' immediately, not 'remove' (that's only
+      // after the full linger window), so excluding just 'remove' here
+      // left a rolled-but-still-ITM position visible in this ranking --
+      // exactly the position most likely to be ITM, since that's usually
+      // why it got rolled in the first place.
+      if(status==='remove'||status==='expired-linger')return;
       const pricing=_getPosPricing(pos,isCall);
       if(pricing.currentPrice==null||!pricing.itm)return; // only rank positions currently ITM
 
