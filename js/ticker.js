@@ -66,8 +66,8 @@ async function loadTicker(){
       // a mutual fund) instead of aborting this whole Promise.all and
       // discarding the Yahoo quote/history data that succeeded fine on its
       // own. prefetch.js already guards this identical call the same way.
-      const _e=await fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`).catch(e=>{console.warn('earnings calendar failed:',t,e?.message);return null;});
-      const _u=_fetchUpgrades?await fh(`/stock/upgrade-downgrade?symbol=${t}&from=${fmtDate(addDays(new Date(),-90))}`).catch(()=>null):null;
+      const _e=await _tkTimeout(fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`),10000,'earnings').catch(e=>{console.warn('earnings calendar failed:',t,e?.message);return null;});
+      const _u=_fetchUpgrades?await _tkTimeout(fh(`/stock/upgrade-downgrade?symbol=${t}&from=${fmtDate(addDays(new Date(),-90))}`),8000,'upgrades').catch(()=>null):null;
       return[_e,_u];
     })();
     const _yahooBatch=Promise.all([
@@ -150,7 +150,7 @@ async function loadTicker(){
         // inside the qs-success branch below. Read directly off the saved
         // snap by the Refresh Health tracking and the Valuation dashboard
         // view -- one flag, one source of truth, no separate tracking.
-        summaryDegraded:true,summaryTs:_prevSnap?.summaryTs??null,
+        summaryDegraded:true,summaryTs:_prevSnap?.summaryTs??null,summaryTsEpoch:_prevSnap?.summaryTsEpoch??null,
         ts:nowPT(),tsEpoch:Date.now(),isLive:true
       };
       S.set('snap_'+t,snap);
@@ -159,14 +159,14 @@ async function loadTicker(){
       // whatever was previously cached untouched, rather than overwriting it with an
       // empty array and a fresh timestamp (which previously masked real failures).
       if(_fetchUpgrades&&upgrades!==null){
-        S.set('upgrades_'+t,{data:upgrades&&upgrades.length?upgrades.slice(0,6):[],ts:nowPT()});
+        S.set('upgrades_'+t,{data:upgrades&&upgrades.length?upgrades.slice(0,6):[],ts:nowPT(),tsEpoch:Date.now()});
       }
 
       // Enrich with Yahoo quoteSummary (beta, short interest, R40 inputs, price targets, trends)
       // -- qs was already fetched concurrently above, alongside the quote and hist2y calls
       try{
         if(qs){
-          snap.summaryDegraded=false;snap.summaryTs=nowPT();
+          snap.summaryDegraded=false;snap.summaryTs=nowPT();snap.summaryTsEpoch=Date.now();
           if(qs.sector!=null)snap.sector=qs.sector;
           if(qs.industry!=null)snap.industry=qs.industry;
           if(qs.beta!=null)snap.beta=qs.beta;
@@ -254,7 +254,7 @@ async function loadTicker(){
     // dense price map and confirmed BMO/AMC report timing.
     _updateMultipleHistory(t,S.get('snap_'+t),S.get('hist2y_'+t));
     _updateNextFYHistory(t,S.get('snap_'+t),S.get('hist2y_'+t));
-    try{news=await fetchNews(t);S.set('news_'+t,{items:(news||[]).slice(0,10).map(n=>({headline:n.headline,summary:n.summary?n.summary.slice(0,200):null,url:n.url,source:n.source,datetime:n.datetime,sentiment:n.sentiment})),ts:nowPT()});}
+    try{news=await _tkTimeout(fetchNews(t),10000,'news');S.set('news_'+t,{items:(news||[]).slice(0,10).map(n=>({headline:n.headline,summary:n.summary?n.summary.slice(0,200):null,url:n.url,source:n.source,datetime:n.datetime,sentiment:n.sentiment})),ts:nowPT(),tsEpoch:Date.now()});}
     catch{const cn=S.get('news_'+t);if(cn)news=cn.items;}
     const upgradesData=S.get('upgrades_'+t)?.data||[];
     // Re-read snap from localStorage to pick up fetchQuoteSummary enrichment
@@ -393,6 +393,16 @@ function buildRecTrendCard(trend){
 
 const _MH_TOLERANCE_DAYS=45;
 function _mhDateDiffDays(a,b){return Math.abs((new Date(a)-new Date(b))/86400000);}
+// How far past a fiscal quarter-end a report is allowed to land and still
+// be treated as THAT quarter's report. Real reports typically land 20-45
+// days after quarter-end; 120 days is generous headroom for a genuinely
+// late reporter, while still catching the actual failure mode: if the
+// correct quarter's earnings date is simply missing from tracked history
+// (a data gap), an UNBOUNDED "earliest date at or after quarter-end"
+// search would happily grab the FOLLOWING quarter's report -- months
+// later -- and silently attach it as if it were this quarter's, producing
+// a valid-looking but wrong report date, report price, and TTM multiple.
+const _MH_MAX_REPORT_LAG_DAYS=120;
 
 // {dateStr: close} map from a hist2y_-shaped object (timestamps as Date
 // objects or epoch seconds, per _parseHist2yDate's existing handling).
@@ -414,7 +424,8 @@ function _mhPriorTradingDayPrice(priceMap,dateStr){
 // the app rather than a second date source.
 function _mhFindReportInfo(ticker,quarterEndDate){
   const candidates=_getEarningsWithOverrides(ticker).map(_effectiveEarningsDate)
-    .filter(e=>e.date>=quarterEndDate).sort((a,b)=>a.date.localeCompare(b.date));
+    .filter(e=>e.date>=quarterEndDate&&_mhDateDiffDays(e.date,quarterEndDate)<=_MH_MAX_REPORT_LAG_DAYS)
+    .sort((a,b)=>a.date.localeCompare(b.date));
   return candidates.length?candidates[0]:null;
 }
 // AMC: report lands after this close, so it's still the last clean price.
@@ -658,14 +669,54 @@ function _updateNextFYHistory(ticker,snap,hist2yCache){
     let hist=S.get(histKey)||[];
 
     // Rollover: the fiscal year "+1y" now points to is different from the
-    // one we were tracking -- archive what we have (if anything was ever
-    // captured) and start fresh for the new year.
+    // one we were tracking. Don't commit to archiving on a single fetch's
+    // say-so -- Yahoo's own +1y math can occasionally glitch for one
+    // refresh and then revert, and an immediate rollover on that alone
+    // would archive a perfectly good, still-current fiscal year and start
+    // spurious tracking for nothing. Require the SAME new end date to
+    // show up on two CONSECUTIVE fetches before treating it as real: a
+    // glitch that reverts never accumulates the second confirmation,
+    // while a genuine rollover (which persists on every subsequent fetch
+    // until the NEXT real one) naturally confirms itself on the very next
+    // call. Also require the new date to be chronologically plausible --
+    // strictly LATER than the current one, by roughly a fiscal year (a
+    // 52/53-week fiscal calendar can drift a bit, hence the wide-ish
+    // band) -- since two observations of an equally-implausible glitch
+    // (e.g. two stale-cache reads in a row) would otherwise still pass
+    // the confirmation check alone.
     if(track&&track.targetFYEnd!==p1y.endDate){
-      if(track.entries.length){
-        hist.push({fyEndDate:track.targetFYEnd,resolvedDate:today,entries:track.entries});
-        hist.sort((a,b)=>a.fyEndDate.localeCompare(b.fyEndDate));
+      if(track.pendingFYEnd===p1y.endDate){
+        const gapDays=_mhDateDiffDays(p1y.endDate,track.targetFYEnd);
+        const isForward=new Date(p1y.endDate)>new Date(track.targetFYEnd);
+        if(isForward&&gapDays>=300&&gapDays<=430){
+          if(track.entries.length){
+            hist.push({fyEndDate:track.targetFYEnd,resolvedDate:today,entries:track.entries});
+            hist.sort((a,b)=>a.fyEndDate.localeCompare(b.fyEndDate));
+          }
+          track=null;
+        }else{
+          // Confirmed twice, but not a chronologically plausible new
+          // fiscal year -- more likely two reads of the same lingering
+          // bad data than a real rollover. Leave the existing track
+          // alone; clear the pending marker so a genuinely different
+          // (plausible) value later gets its own fresh two-fetch check
+          // rather than being silently pre-confirmed by this one.
+          track.pendingFYEnd=null;
+          S.set(trackKey,track);S.set(histKey,hist);
+          return;
+        }
+      }else{
+        // First time seeing this particular new end date -- note it and
+        // wait for the next fetch to confirm; don't touch the existing
+        // track yet.
+        track.pendingFYEnd=p1y.endDate;
+        S.set(trackKey,track);S.set(histKey,hist);
+        return;
       }
-      track=null;
+    }else if(track&&track.pendingFYEnd!=null){
+      // This fetch matches what we already had after all -- the earlier
+      // "new" reading didn't stick. Clear the stale pending marker.
+      track.pendingFYEnd=null;
     }
     if(!track)track={targetFYEnd:p1y.endDate,entries:[]};
 
@@ -759,7 +810,9 @@ function _buildMultipleHistoryCard(ticker){
      })()
      +'</div>';
   return '<div class="card"><div class="card-title"><span class="dot" style="background:var(--accent)"></span>Multiple History (TTM &amp; Forward P/E)</div>'
-    +'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">TTM-composite basis -- trailing quarters + this quarter\'s estimate</div>'
+    +'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">TTM-composite basis -- trailing quarters + this quarter\'s estimate'
+    +(()=>{const snap=S.get('snap_'+ticker);const fl=snap?_earningsFreshnessLabel(snap.earningsDate,snap.earningsHour,snap.summaryTsEpoch):null;return fl?' &middot; <span style="color:var(--text2)">'+fl+'</span>':'';})()
+    +'</div>'
     +body+'</div>';
 }
 
@@ -795,13 +848,23 @@ function _renderMultipleHistoryChart(ticker,hist2y){
   // Nearest tracked quarter (soonest targetQuarterEnd) -- the further-out
   // quarter's dense data is still stored for future use, just not plotted
   // alongside this one in this pass.
-  const nearestGroup=track.slice().sort((a,b)=>a.targetQuarterEnd.localeCompare(b.targetQuarterEnd))[0];
+  const sortedGroups=track.slice().sort((a,b)=>a.targetQuarterEnd.localeCompare(b.targetQuarterEnd));
+  const nearestGroup=sortedGroups[0];
 
   // Future projection boundary: the next expected announcement date if
   // known (Finnhub-sourced, an actual announcement-date estimate), falling
   // back to the tracked quarter's fiscal period-end if that's missing.
-  // Skipped entirely (no future zone drawn) if neither is available.
-  const boundaryDate=snap?.earningsDate||nearestGroup?.targetQuarterEnd||null;
+  // On the ticker's own earnings day itself -- before the print has posted
+  // and the quarter has rolled over -- that boundary IS today, which would
+  // otherwise collapse the projection zone to zero width and silently hide
+  // the slider. In that case, fall back further to the NEXT tracked
+  // quarter's period-end, so there's still a real future point to project
+  // toward. Skipped entirely (no future zone drawn) only if nothing further
+  // out is available either.
+  let boundaryDate=snap?.earningsDate||nearestGroup?.targetQuarterEnd||null;
+  if(boundaryDate&&nowLabel&&boundaryDate<=nowLabel){
+    boundaryDate=sortedGroups[1]?.targetQuarterEnd||null;
+  }
   const futureLabel=(boundaryDate&&nowLabel&&boundaryDate>nowLabel)?boundaryDate:null;
   // Computed once, early, so both the slider's text and the chart's
   // boundary marker can reference the same value without ordering issues.
@@ -842,7 +905,22 @@ function _renderMultipleHistoryChart(ticker,hist2y){
   // means the initial line already reflects where the slider will sit,
   // rather than snapping to a slightly different value the moment it's
   // first touched.
-  const currentEps=nearestGroup?.entries?.length?nearestGroup.entries[nearestGroup.entries.length-1].projTtmEps:null;
+  // Falls back through progressively older tracked entries to find the
+  // most recent one with a genuinely positive EPS, rather than strictly
+  // the literal last entry -- a single bad/missing value on the newest
+  // entry (a real estimate swing, or a data hiccup) shouldn't silently
+  // disable the slider when perfectly good data sits one entry back. Most
+  // tickers never need more than one step back; this only matters for a
+  // name whose forward EPS is thin enough that one revision can tip a
+  // single point to zero or negative.
+  const currentEps=(()=>{
+    const entries=nearestGroup?.entries;
+    if(!entries?.length)return null;
+    for(let i=entries.length-1;i>=0;i--){
+      if(entries[i].projTtmEps>0)return entries[i].projTtmEps;
+    }
+    return null;
+  })();
   // The single upcoming quarter's own estimate, distinct from currentEps
   // above (which is the TTM-basis figure -- 3 trailing actuals + this
   // estimate -- actually used in the multiple/price math throughout this
@@ -1174,7 +1252,9 @@ function _buildNextFYCard(ticker){
      })()
      +'</div>';
   return '<div class="card"><div class="card-title"><span class="dot" style="background:var(--accent2)"></span>Next-FY Multiple &amp; Price Target</div>'
-    +'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">Next fiscal year basis -- the figure most analyst coverage means by "next year\'s multiple"</div>'
+    +'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">Next fiscal year basis -- the figure most analyst coverage means by "next year\'s multiple"'
+    +(()=>{const snap=S.get('snap_'+ticker);const fl=snap?_earningsFreshnessLabel(snap.earningsDate,snap.earningsHour,snap.summaryTsEpoch):null;return fl?' &middot; <span style="color:var(--text2)">'+fl+'</span>':'';})()
+    +'</div>'
     +body+'</div>';
 }
 
@@ -1218,7 +1298,16 @@ function _renderNextFYChart(ticker,hist2y){
   const priceSeries=labels.map(d=>denseByLabel[d]??sparsePriceByLabel[d]??null);
   const nowPriceValue=nowIdx>=0?priceSeries[nowIdx]:null;
 
-  const currentEps=track?.entries?.length?track.entries[track.entries.length-1].nextFYEps:null;
+  // See the Multiple History chart's matching comment -- same fallback,
+  // same reasoning, using this chart's own field name.
+  const currentEps=(()=>{
+    const entries=track?.entries;
+    if(!entries?.length)return null;
+    for(let i=entries.length-1;i>=0;i--){
+      if(entries[i].nextFYEps>0)return entries[i].nextFYEps;
+    }
+    return null;
+  })();
   const currentMultiple=(nowPriceValue!=null&&currentEps>0)?nowPriceValue/currentEps:null;
   const sliderApplicable=futureIdx>nowIdx&&nowIdx>=0&&currentEps>0&&currentMultiple>0;
   const defaultSliderVal=sliderApplicable?Math.round(currentMultiple*2)/2:null;
@@ -1700,7 +1789,13 @@ function _rsiTransitionCardHtml(ticker,preloadedHist2y){
   if(!trans){
     const h2=preloadedHist2y||S.get('hist2y_'+ticker);
     const rsi=h2?.closes?.length>=80?computeRSI(h2.closes,14):null;
-    const lastRSI=rsi&&rsi.length?rsi[rsi.length-1]:null;
+    // rsi.length (now always h2.closes.length when rsi is non-null) no
+    // longer signals whether the LAST position specifically has a real
+    // value -- computeRSI can now return internal/trailing nulls for a
+    // gap or an unsettled latest bar. Search backward for the actual
+    // last non-null entry, same fix as _getRSIRecentTransition.
+    let lastRSI=null;
+    if(rsi){for(let i=rsi.length-1;i>=0;i--){if(rsi[i]!=null){lastRSI=rsi[i];break;}}}
     const rsiStr=lastRSI!=null?lastRSI.toFixed(0):'--';
     return`<div class="card"><div style="font-family:var(--mono);font-size:11px;color:var(--text3)">RSI: ${rsiStr} (neutral) -- no recent oversold/overbought signal</div></div>`;
   }
@@ -1775,7 +1870,7 @@ function _tickerNoteSectionHtml(ticker){
   const note=S.get('watchlist_note_'+ticker)||'';
   return `<div id="ticker-note-section" data-ticker="${ticker}" onclick="_openNoteModal('${ticker}')" style="cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px;font-family:var(--mono);font-size:11px">`+
     (note?
-      `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><span style="color:var(--text2);white-space:pre-wrap;word-break:break-word;flex:1">${note.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span><span style="flex-shrink:0;color:var(--accent3);font-size:10px">Edit</span></div>`
+      `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><span style="color:var(--text2);white-space:pre-wrap;word-break:break-word;flex:1">${_escHtml(note)}</span><span style="flex-shrink:0;color:var(--accent3);font-size:10px">Edit</span></div>`
     :
       `<span style="color:var(--text3)">+ Add note</span>`
     )+
@@ -1809,11 +1904,24 @@ function renderTickerContent(snap,hist,hist1y,news,recData,upgradesData,isLive,h
   if(isLive){_lastLiveRenderTicker=snap.ticker;_lastLiveRenderTime=Date.now();}
   const el=document.getElementById('ticker-content');
   const chgColor=snap.change>=0?'var(--green)':'var(--red)';const chgSign=snap.change>=0?'+':'';
+  // Sticky ticker/price bar -- stays pinned below the nav tabs as the page
+  // is scrolled, so the ticker being viewed doesn't get lost on a long page
+  // (or after switching tabs and back). Populated from the same snap this
+  // whole render already has, on every real render regardless of entry
+  // path (fresh fetch or cache restore both funnel through here).
+  const stickyBar=document.getElementById('ticker-sticky-bar');
+  if(stickyBar){
+    stickyBar.style.display='flex';
+    const symEl=document.getElementById('ticker-sticky-symbol');
+    const priceEl=document.getElementById('ticker-sticky-price');
+    if(symEl)symEl.textContent=snap.ticker;
+    if(priceEl)priceEl.innerHTML=snap.price!=null?`$${snap.price.toFixed(2)} <span style="color:${chgColor}">${chgSign}${(snap.change||0).toFixed(2)} (${chgSign}${(snap.changePct||0).toFixed(2)}%)</span>`:'';
+  }
   const _tickerHasPositions=_getIncomePositionsForTicker(snap.ticker).length>0;
   let rsiStr='N/A',bbStr='',bbData=null;
   if(hist&&hist.closes&&hist.closes.length>20){
     const closes=hist.closes.filter(c=>c!==null);const rsi=computeRSI(closes);
-    rsiStr=rsi.length?rsi[rsi.length-1].toFixed(1):'N/A';
+    rsiStr=(rsi.length&&rsi[rsi.length-1]!=null)?rsi[rsi.length-1].toFixed(1):'N/A';
     // Buffered BB computation (see _computeBBData) -- reads the raw
     // hist2y_ cache directly by ticker rather than the hist2y parameter,
     // since that parameter can be total-return/adjclose-based when the
@@ -1870,8 +1978,8 @@ function renderTickerContent(snap,hist,hist1y,news,recData,upgradesData,isLive,h
   const ivr=ivrInfo(ivrVal);
   // Persist IVR back to snap so watchlist/dashboard can read it without recomputing
   if(ivrVal!=null){snap.ivrVal=ivrVal;S.set('snap_'+snap.ticker,snap);}
-  let impliedMoveStr='N/A';
-  try{const oc=S.get('options_'+snap.ticker);const res=oc?.data?.optionChain?.result?.[0];if(res&&snap.price){const opts=res.options?.[0];if(opts){const atmP=(opts.puts||[]).filter(p=>Math.abs(p.strike-snap.price)/snap.price<0.03);const atmC=(opts.calls||[]).filter(c=>Math.abs(c.strike-snap.price)/snap.price<0.03);if(atmP.length&&atmC.length){const straddle=((atmP[0].bid+atmP[0].ask)/2)+((atmC[0].bid+atmC[0].ask)/2);impliedMoveStr=`+/-${(straddle/snap.price*100).toFixed(1)}% ($${straddle.toFixed(2)} straddle)`;}}}}catch{}
+  let impliedMoveStr='N/A',impliedMoveExpDate=null;
+  try{const _near=_nearestExpEntryDated(snap.ticker);if(_near&&snap.price){const _atm=_atmStraddle(_near.entry,snap.price);if(_atm){impliedMoveStr=`+/-${(_atm.straddle/snap.price*100).toFixed(1)}% ($${_atm.straddle.toFixed(2)} straddle)`;impliedMoveExpDate=_near.date;}}}catch{}
   // Short interest: prefer Yahoo quoteSummary (reliable on free tier)
   // Fall back to Finnhub fields if Yahoo not yet fetched
   let shortStr='N/A (not reported)';
@@ -1960,13 +2068,15 @@ return`<div style="font-family:var(--mono);font-size:12px;color:${snap.postMarke
         ${todayVol==null?'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:4px">Refresh ticker to load today&#39;s volume</div>':''}
       </div>
       <div class="metric-tile" style="grid-column:span 2"><div class="metric-label">Volatility Rank (HVR)</div><div style="margin-top:4px">${ivr.badge||'N/A'}</div><div class="metric-sub" style="margin-top:4px;font-size:10px;line-height:1.4">${ivr.guidance}</div></div>
-      ${impliedMoveStr!=='N/A'?`<div class="metric-tile" style="grid-column:span 2"><div class="metric-label">Implied Move (from options)</div><div class="metric-value" style="font-size:13px">${impliedMoveStr}</div><div class="metric-sub">ATM straddle-implied move. Use to gauge how far OTM your strike should be.</div></div>`:''}
+      ${impliedMoveStr!=='N/A'?`<div class="metric-tile" style="grid-column:span 2"><div class="metric-label">Implied Move (from options)</div><div class="metric-value" style="font-size:13px">${impliedMoveStr}</div><div class="metric-sub">ATM straddle-implied move (${impliedMoveExpDate?_expLabel(impliedMoveExpDate)+' expiration':'nearest cached expiration'}). Use to gauge how far OTM your strike should be.</div></div>`:''}
     </div>
     ${earningsStr}
   </div>
-  ${hist?`<div class="card"><div class="card-title" style="display:flex;justify-content:space-between;align-items:center"><span><span class="dot"></span>Bollinger Bands + RSI + Volume + HVR</span><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:${getGapOverlayToggle()?'1':'0.4'}" id="bb-gap-toggle-btn" onclick="toggleGapOverlay()">Gaps</button></div><div style="display:flex;gap:6px;margin-bottom:4px"><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-1m" onclick="toggleBBSpan(\'1m\')">1M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-3m" onclick="toggleBBSpan(\'3m\')">3M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px" id="bb-btn-6m" onclick="toggleBBSpan(\'6m\')">6M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-1y" onclick="toggleBBSpan(\'1y\')">1Y</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-2y" onclick="toggleBBSpan(\'2y\')">2Y</button></div><div class="chart-wrap" style="height:180px"><canvas id="bb-chart"></canvas></div><div class="chart-wrap" style="height:90px"><canvas id="rsi-chart"></canvas></div><div class="chart-wrap" style="height:70px;margin-top:4px"><canvas id="vol-chart"></canvas></div><div class="chart-wrap" style="height:60px;margin-top:4px"><canvas id="hvr-chart"></canvas></div><div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:6px">${bbStr}</div><div class="commentary" style="margin-top:10px">Bollinger Bands: upper band touch = statistically extended, overbought. Lower band touch = oversold. Narrow bands signal compressed volatility.
+  ${hist?`<div class="card"><div class="card-title" style="display:flex;justify-content:space-between;align-items:center"><span><span class="dot"></span>Bollinger Bands + RSI + MACD + Volume + HVR</span><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:${getGapOverlayToggle()?'1':'0.4'}" id="bb-gap-toggle-btn" onclick="toggleGapOverlay()">Gaps</button></div><div style="display:flex;gap:6px;margin-bottom:4px"><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-1m" onclick="toggleBBSpan(\'1m\')">1M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-3m" onclick="toggleBBSpan(\'3m\')">3M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px" id="bb-btn-6m" onclick="toggleBBSpan(\'6m\')">6M</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-1y" onclick="toggleBBSpan(\'1y\')">1Y</button><button class="btn btn-secondary" style="font-size:10px;padding:2px 8px;opacity:0.4" id="bb-btn-2y" onclick="toggleBBSpan(\'2y\')">2Y</button></div><div class="chart-wrap" style="height:180px"><canvas id="bb-chart"></canvas></div><div class="chart-wrap" style="height:90px"><canvas id="rsi-chart"></canvas></div><div class="chart-wrap" style="height:90px;margin-top:4px"><canvas id="macd-chart"></canvas></div><div id="macd-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:2px;margin-bottom:4px"></div><div class="chart-wrap" style="height:70px;margin-top:4px"><canvas id="vol-chart"></canvas></div><div class="chart-wrap" style="height:60px;margin-top:4px"><canvas id="hvr-chart"></canvas></div><div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:6px">${bbStr}</div><div class="commentary" style="margin-top:10px">Bollinger Bands: upper band touch = statistically extended, overbought. Lower band touch = oversold. Narrow bands signal compressed volatility.
 
 RSI (14): below 30 (green shading) = oversold, favorable for puts. Above 70 (red shading) = overbought, favorable for covered calls.
+
+MACD (12/26/9): line above zero = bullish bias, below = bearish. Line crossing above its signal = momentum shift up, below = down. Histogram (the gap between them) growing = momentum strengthening, shrinking = fading. Most reliable when the stock is actually trending -- prone to false crossovers in choppy, sideways conditions.
 
 Volume: green bars = up days, yellow bars = 20-day average. Spikes on breakouts confirm momentum; low volume on moves suggests weak conviction.
 
@@ -2037,7 +2147,7 @@ function renderBBChart(bbData,hist){
     window._bbChart=new Chart(bbCtx,{type:'line',data:{labels,datasets:[{data:bbData.closes,borderColor:'#e8eaf0',borderWidth:1.5,pointRadius:0,tension:0.2,fill:false},{data:bbData.sma20,borderColor:'#7c6af7',borderWidth:1,pointRadius:0,borderDash:[4,3],fill:false},{data:bbData.upper,borderColor:'#ff4757',borderWidth:1,pointRadius:0,borderDash:[2,3],fill:false},{data:bbData.lower,borderColor:'#00c896',borderWidth:1,pointRadius:0,borderDash:[2,3],fill:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#555870',font:{size:9},maxTicksLimit:6},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9}},grid:{color:'#2a2e38'}}}},plugins:[gapPlugin]});
   }
   const rsiCtx=document.getElementById('rsi-chart')?.getContext('2d');
-  if(rsiCtx&&rsiVals.length>0){
+  if(rsiCtx&&rsiVals.some(v=>v!=null)){
     // rsiVals can now be LONGER than labels when hist carries lookback
     // buffer (see _computeBBData/toggleBBSpan) -- the old assumption here
     // was that rsiVals could only ever be shorter (computeRSI eating into
@@ -2049,6 +2159,27 @@ function renderBBChart(bbData,hist){
     const ob=rsiTrimmed.map(v=>v>=70?v:null),os=rsiTrimmed.map(v=>v<=30?v:null);
     if(window._rsiChart)window._rsiChart.destroy();
     window._rsiChart=new Chart(rsiCtx,{type:'line',data:{labels:rsiLabels,datasets:[{data:ob,borderColor:'transparent',backgroundColor:'rgba(255,71,87,0.25)',fill:{target:{value:70},above:'rgba(255,71,87,0.25)',below:'transparent'},pointRadius:0,tension:0.2,spanGaps:false},{data:os,borderColor:'transparent',backgroundColor:'rgba(0,200,150,0.25)',fill:{target:{value:30},above:'transparent',below:'rgba(0,200,150,0.25)'},pointRadius:0,tension:0.2,spanGaps:false},{label:'RSI',data:rsiTrimmed,borderColor:'#7c6af7',borderWidth:1.5,pointRadius:0,tension:0.2,fill:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{display:false},grid:{color:'#2a2e38'}},y:{min:0,max:100,ticks:{color:'#555870',font:{size:9},stepSize:30},grid:{color:'#2a2e38'}}}},plugins:[{id:'rsiLines',afterDraw(chart){const c=chart.ctx,x=chart.scales.x,y=chart.scales.y;const y70=y.getPixelForValue(70),y30=y.getPixelForValue(30);c.save();c.setLineDash([4,3]);c.lineWidth=1;c.strokeStyle='rgba(255,71,87,0.7)';c.beginPath();c.moveTo(x.left,y70);c.lineTo(x.right,y70);c.stroke();c.strokeStyle='rgba(0,200,150,0.7)';c.beginPath();c.moveTo(x.left,y30);c.lineTo(x.right,y30);c.stroke();c.setLineDash([]);c.font='9px DM Mono,monospace';c.fillStyle='rgba(255,71,87,0.9)';c.fillText('70',x.right+3,y70+3);c.fillStyle='rgba(0,200,150,0.9)';c.fillText('30',x.right+3,y30+3);c.restore();}}]});
+  }
+  // MACD reads the full raw hist2y_ cache directly rather than the
+  // buffered `hist` param -- unlike Bollinger's bounded 20-day SMA, EMA
+  // carries decaying memory of ALL prior closes, so it needs real history
+  // to converge (the existing ~19-day buffer that's plenty for RSI's
+  // 14-period lookback would leave a 26-period EMA barely seeded, or
+  // entirely null, for short spans). Sliced down to the display window
+  // afterward, same trim-to-match-labels approach already used for RSI
+  // above, since a rare gap day can shift array lengths by a day or two.
+  const _macdT=document.getElementById('ticker-select')?.value||currentTicker;
+  const _macdH2=S.get('hist2y_'+_macdT);
+  const macdCtx=document.getElementById('macd-chart')?.getContext('2d');
+  if(macdCtx&&_macdH2?.closes){
+    const macd=computeMACD(_macdH2.closes);
+    const trim=arr=>arr.length>labels.length?arr.slice(arr.length-labels.length):arr;
+    const macdLabels=macd.macdLine.length>labels.length?labels:labels.slice(labels.length-macd.macdLine.length);
+    const macdLine=trim(macd.macdLine),signalLine=trim(macd.signalLine),histogram=trim(macd.histogram);
+    if(window._macdChart)window._macdChart.destroy();
+    window._macdChart=new Chart(macdCtx,{data:{labels:macdLabels,datasets:[{type:'bar',data:histogram,backgroundColor:histogram.map(v=>v==null?'transparent':v>=0?'rgba(0,200,150,0.5)':'rgba(255,71,87,0.5)'),borderWidth:0},{type:'line',data:macdLine,borderColor:'#4fc3f7',borderWidth:1.5,pointRadius:0,tension:0.15,fill:false},{type:'line',data:signalLine,borderColor:'#ff9f43',borderWidth:1.5,pointRadius:0,tension:0.15,fill:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{display:false},grid:{color:'#2a2e38'}},y:{ticks:{color:'#555870',font:{size:9}},grid:{color:'#2a2e38'}}}},plugins:[{id:'macdZeroLine',afterDraw(chart){const c=chart.ctx,x=chart.scales.x,y=chart.scales.y;const y0=y.getPixelForValue(0);c.save();c.strokeStyle='#555870';c.lineWidth=1;c.beginPath();c.moveTo(x.left,y0);c.lineTo(x.right,y0);c.stroke();c.restore();}}]});
+    const statusEl=document.getElementById('macd-status');
+    if(statusEl)statusEl.textContent=_macdStatusText(macd.macdLine,macd.signalLine,macd.histogram);
   }
 }
 
@@ -2621,6 +2752,14 @@ function _computeEarningsReactionEvents(hist2y,hist2ySP,earningsHistory){
 
     events.push({
       date:eDate,hour,
+      // Whether the announcement hour is ACTUALLY known, vs. an unknown
+      // hour silently defaulting to the BMO reaction-day convention above
+      // ("BMO or unknown -- reaction on D"). A genuinely AMC report
+      // treated as BMO reads the wrong day as the reaction day, which can
+      // flip its measured direction entirely -- downstream aggregates
+      // should exclude these from averaged reaction stats rather than
+      // quietly blending them in as if the hour were confirmed.
+      hourKnown:!!hour,
       reactionPct,spReactionPct,excessReaction,
       preDayRet,excessPre,
       postDayRet,excessPost,
@@ -2640,11 +2779,16 @@ function _computeEarningsPatternSummary(ticker,hist2y,hist2ySP,earningsHistory){
 
   if(!events.length)return null;
 
-  // Aggregate
-  const validReaction=events.filter(e=>e.reactionPct!=null);
-  const validExcess=events.filter(e=>e.excessReaction!=null);
-  const validPre=events.filter(e=>e.preDayRet!=null);
-  const validPost=events.filter(e=>e.postDayRet!=null);
+  // Aggregate -- only events with a CONFIRMED announcement hour. An
+  // unknown-hour event's reaction day is a guess (defaults to the BMO
+  // convention inside _computeEarningsReactionEvents), so including it
+  // here could silently mix a wrong-day reading into the averages. Still
+  // shown in the raw per-event list below, just excluded from what gets
+  // averaged and presented as "how this ticker typically reacts."
+  const validReaction=events.filter(e=>e.reactionPct!=null&&e.hourKnown);
+  const validExcess=events.filter(e=>e.excessReaction!=null&&e.hourKnown);
+  const validPre=events.filter(e=>e.preDayRet!=null&&e.hourKnown);
+  const validPost=events.filter(e=>e.postDayRet!=null&&e.hourKnown);
 
   if(!validReaction.length)return null;
 
@@ -2676,7 +2820,7 @@ function _computeEarningsPatternSummary(ticker,hist2y,hist2ySP,earningsHistory){
       e.source==='gap-estimated'?'':
       e.source==='auto-confirmed'?'<span style="color:var(--accent);font-size:8px"> auto</span>':
       '<span style="color:var(--text3);font-size:8px"> ~est</span>';
-    const hourLabel=e.hour?' '+e.hour.toUpperCase():'';
+    const hourLabel=e.hour?' '+e.hour.toUpperCase():' <span style="color:var(--warn)">(hour unknown -- reaction day assumed, excluded from averages)</span>';
     return `<div style="font-family:var(--mono);font-size:10px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.04)">
       <div style="display:flex;justify-content:space-between">
         <span style="color:var(--text3)">${e.date}${hourLabel}${srcLabel}</span>
@@ -3273,10 +3417,10 @@ async function refreshSingleTicker(){
     // -- a mutual fund genuinely has no earnings calendar, and that should
     // degrade gracefully rather than aborting the whole refresh before it
     // even reaches the quote/history steps below.
-    const earnings=await fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`).catch(e=>{console.warn('earnings calendar failed:',t,e?.message);return null;});
+    const earnings=await _tkTimeout(fh(`/calendar/earnings?symbol=${t}&from=${fmtDate(addDays(new Date(),-740))}&to=${fmtDate(addDays(new Date(),180))}`),10000,'earnings').catch(e=>{console.warn('earnings calendar failed:',t,e?.message);return null;});
     let upgrades=null,priceTargetS=null;
     if(_fetchUpgrades){
-      try{upgrades=await fh(`/stock/upgrade-downgrade?symbol=${t}&from=${fmtDate(addDays(new Date(),-90))}`);}catch(e){_rUpgradesErr=e?.message||'failed';}
+      try{upgrades=await _tkTimeout(fh(`/stock/upgrade-downgrade?symbol=${t}&from=${fmtDate(addDays(new Date(),-90))}`),8000,'upgrades');}catch(e){_rUpgradesErr=e?.message||'failed';}
     }
     // Build snap from Yahoo /quote. Fetched concurrently with 2Y history
     // (rather than waiting for Step 3 below) specifically so the
@@ -3285,7 +3429,7 @@ async function refreshSingleTicker(){
     setP(20,'Fetching '+t+' Yahoo quote...');
     let ah,_rh2;
     [ah,_rh2]=await Promise.all([
-      fetchAfterHoursPrice(t),
+      _tkTimeout(fetchAfterHoursPrice(t),10000,'quote').catch(e=>{console.warn('quote failed:',t,e?.message);return null;}),
       _tkTimeout(yahooHistory(t,'2y','1d'),15000,'hist2y').catch(e=>{console.warn('hist2y failed:',t,e?.message);return null;})
     ]);
     if(!ah)ah={};
@@ -3329,7 +3473,7 @@ async function refreshSingleTicker(){
       ptMean:_rPrevSnap?.ptMean??null,ptHigh:_rPrevSnap?.ptHigh??null,ptLow:_rPrevSnap?.ptLow??null,ptAnalysts:_rPrevSnap?.ptAnalysts??null,
       earningsTrend:_rPrevSnap?.earningsTrend??null,recTrend:_rPrevSnap?.recTrend??null,earningsHistoryYahoo:_rPrevSnap?.earningsHistoryYahoo??null,
       revenueGrowthYahoo:_rPrevSnap?.revenueGrowthYahoo??null,operatingMarginsYahoo:_rPrevSnap?.operatingMarginsYahoo??null,fcfMarginYahoo:_rPrevSnap?.fcfMarginYahoo??null,
-      summaryDegraded:true,summaryTs:_rPrevSnap?.summaryTs??null,
+      summaryDegraded:true,summaryTs:_rPrevSnap?.summaryTs??null,summaryTsEpoch:_rPrevSnap?.summaryTsEpoch??null,
       ts:nowPT(),tsEpoch:Date.now(),isLive:true
     };
     // Save pending earnings date + promote passed dates to confirmed
@@ -3344,8 +3488,8 @@ async function refreshSingleTicker(){
     }catch{}
     // Step 2: Yahoo quoteSummary (beta, short interest, R40 inputs, price targets, trends)
     setP(20,'Fetching '+t+' extended data...');
-      try{const qs=await fetchQuoteSummary(t);if(qs){
-        snap.summaryDegraded=false;snap.summaryTs=nowPT();
+      try{const qs=await _tkTimeout(fetchQuoteSummary(t),10000,'quoteSummary');if(qs){
+        snap.summaryDegraded=false;snap.summaryTs=nowPT();snap.summaryTsEpoch=Date.now();
         if(qs.sector!=null)snap.sector=qs.sector;
         if(qs.industry!=null)snap.industry=qs.industry;
         if(qs.beta!=null)snap.beta=qs.beta;
@@ -3365,7 +3509,7 @@ async function refreshSingleTicker(){
       if(priceTargetS&&priceTargetS.targetMean){snap.ptMean=priceTargetS.targetMean||null;snap.ptHigh=priceTargetS.targetHigh||null;snap.ptLow=priceTargetS.targetLow||null;}
     S.set('snap_'+t,snap);
     if(_fetchUpgrades&&upgrades!==null){
-      S.set('upgrades_'+t,{data:upgrades&&upgrades.length?upgrades.slice(0,6):[],ts:nowPT()});
+      S.set('upgrades_'+t,{data:upgrades&&upgrades.length?upgrades.slice(0,6):[],ts:nowPT(),tsEpoch:Date.now()});
     }
     // Step 3: Price history
     setP(35,'Fetching '+t+' price history...');
@@ -3385,7 +3529,7 @@ async function refreshSingleTicker(){
       S.set('hist2y_'+t,{timestamps:_rts,closes:_rcl,volumes:_rvl,adjcloses:_rac,opens:_rop,highs:_rhi,lows:_rlo,ts:_rn,tsEpoch:Date.now()});
       if(_idRes&&_idRes.closes&&_idRes.closes.length>=2){
         const _idTs=_idRes.timestamps?_idRes.timestamps.map(d=>d instanceof Date?d.getTime():d):null;
-        S.set('intraday_'+t,{closes:_idRes.closes,timestamps:_idTs,ts:_rn});
+        S.set('intraday_'+t,{closes:_idRes.closes,timestamps:_idTs,ts:_rn,tsEpoch:Date.now()});
       }
     }catch(e){console.warn('refreshSingle hist2y failed:',t,e?.message);}
     // Historical earnings dates for the chart markers. Called directly here
@@ -3403,24 +3547,54 @@ async function refreshSingleTicker(){
     _updateNextFYHistory(t,S.get('snap_'+t),S.get('hist2y_'+t));
     // Step 4: News
     setP(50,'Fetching '+t+' news...');
-    try{const newsData=await fetchNews(t);S.set('news_'+t,{items:(newsData||[]).slice(0,10).map(n=>({headline:n.headline,summary:n.summary?n.summary.slice(0,200):null,url:n.url,source:n.source,datetime:n.datetime,sentiment:n.sentiment})),ts:nowPT()});}catch{}
+    try{const newsData=await _tkTimeout(fetchNews(t),10000,'news');S.set('news_'+t,{items:(newsData||[]).slice(0,10).map(n=>({headline:n.headline,summary:n.summary?n.summary.slice(0,200):null,url:n.url,source:n.source,datetime:n.datetime,sentiment:n.sentiment})),ts:nowPT(),tsEpoch:Date.now()});}catch{}
     // Step 5: Options chain top-level
     setP(65,'Fetching '+t+' options chain...');
     let optionsLoaded=false;
     // Manual refresh always fetches options -- user explicitly requested fresh data.
     // Validation still guards against writing synthetic/zeroed data over good cache.
     const _rtInWindow=_isOptionsLiveWindow();
+    // Three flags, not one -- they answer different questions and the
+    // fallback check below needs to tell them apart:
+    // _tickerFetchFailed: did the live fetch ITSELF fail (network error,
+    //   timeout)? Nothing about this run's data can be trusted at all, so
+    //   falling back to "is there any usable (possibly older) cache" is the
+    //   right safety net -- same as build 480's original behavior.
+    // _tickerWriteFailed: did THIS RUN fail to end up with usable ticker-
+    //   level metadata -- either the write itself failed (fetch succeeded,
+    //   storage rejected it), or the only thing written was a synthetic
+    //   placeholder (a successful write, but not usable data)? Same
+    //   fallback applies either way -- nothing usable came from this run.
+    // _anyExpWriteFailed: did a per-expiration write fail even though the
+    //   ticker-level write succeeded? Here the fallback check would almost
+    //   always find something (we just wrote it), which would silently mask
+    //   exactly the failure being tracked -- so it must NOT trigger the
+    //   fallback on its own.
+    let _tickerFetchFailed=false,_tickerWriteFailed=false,_anyExpWriteFailed=false;
     {
       try{
         const opts=await _tkTimeout(yahooOptionsViaProxy(t),15000,'options');
         // Validate before writing -- reject synthetic/zeroed post-cutoff data
         const _rtv=_validateOptionsData(opts);
         if(_rtv.valid){
-          S.set('options_'+t,{data:slimOptionsData(opts),ts:nowPT()});
+          if(!S.set('options_'+t,{data:slimOptionsData(opts),ts:nowPT(),tsEpoch:Date.now()}))_tickerWriteFailed=true;
         }else if(!S.get('options_'+t)){
-          S.set('options_'+t,{data:slimOptionsData(opts),ts:nowPT(),synthetic:true});
+          S.set('options_'+t,{data:slimOptionsData(opts),ts:nowPT(),tsEpoch:Date.now(),synthetic:true});
+          // Regardless of whether that write itself succeeded, a synthetic
+          // placeholder is not usable data -- four builds in a row (481, 485,
+          // 488, this one) each fixed a different way a plain success/fail
+          // boolean let this specific case slip through as "not a failure".
+          _tickerWriteFailed=true;
+        }else{
+          // The implicit "preserve existing cache" case -- validation
+          // failed, but something's already there, so nothing gets
+          // overwritten. This never checked whether what's being preserved
+          // is itself a synthetic placeholder from an earlier failed run --
+          // the fifth instance of that same gap across builds 481, 485,
+          // 488, and 491, all in this pair of files.
+          const _ex=S.get('options_'+t);
+          if(!_ex||_ex.synthetic)_tickerWriteFailed=true;
         }
-        // else preserve existing good cache
         // Only fetch per-expiry chains if main chain fetch was valid AND we're in live window
         // Outside live window: use _shouldSkipOptionsFetch to correctly honor
         // "Friday cache is still good on Monday pre-market" without re-fetching synthetic data
@@ -3441,24 +3615,52 @@ async function refreshSingleTicker(){
               .then(d=>({pair,data:d})).catch(()=>({pair,data:null}));
           }));
           _expPairs.forEach(({pair,data})=>{
-            if(!data)return;
             const _expKey='options_exp_'+t+'_'+pair.date;
+            if(!data){
+              // A fetch failure only counts as a real problem if there's no
+              // genuinely good (non-synthetic) prior cache to fall back on --
+              // previously this returned early without ever setting
+              // _anyExpWriteFailed, so a wholly-failed fetch could still show
+              // as "including options".
+              const _ex=S.get(_expKey);
+              if(!_ex||_ex.synthetic)_anyExpWriteFailed=true;
+              return;
+            }
             const _expv=_validateOptionsData(data);
             if(_expv.valid){
-              S.set(_expKey,{...data,ts:nowPT()});
+              {const _s=slimExpData(data);if(_s){if(!S.set(_expKey,{..._s,ts:nowPT(),tsEpoch:Date.now()}))_anyExpWriteFailed=true;}}
             }else if(!_rtInWindow&&_hasGoodSameDayCache(_expKey)){
               console.log(t+' '+pair.date+': outside live window, fetch INVALID ('+_expv.reason+') -- preserving same-day exp cache');
             }else if(!S.get(_expKey)){
-              S.set(_expKey,{...data,ts:nowPT(),synthetic:true});
+              {const _s=slimExpData(data);if(_s)S.set(_expKey,{..._s,ts:nowPT(),tsEpoch:Date.now(),synthetic:true});}
+              // Same reasoning as the ticker-level branch above -- writing a
+              // synthetic placeholder isn't usable data even when the write
+              // itself succeeds.
+              _anyExpWriteFailed=true;
             }else{
-              console.warn(t+' '+pair.date+': exp rejected ('+_expv.reason+'), preserving cache');
+              // Same "is what's being preserved actually real" check as the
+              // fetch-failure branch above -- this used to preserve silently
+              // regardless of whether the existing entry was synthetic.
+              const _ex=S.get(_expKey);
+              if(_ex&&!_ex.synthetic)console.warn(t+' '+pair.date+': exp rejected ('+_expv.reason+'), preserving cache');
+              else{console.warn(t+' '+pair.date+': exp rejected ('+_expv.reason+'), no good prior cache to fall back on');_anyExpWriteFailed=true;}
             }
           });
-          optionsLoaded=true;
+          // A run with no failed writes counts as loaded even with zero
+          // attempted writes (e.g. every expiration preserved existing good
+          // cache).
+          optionsLoaded=!_tickerWriteFailed&&!_anyExpWriteFailed;
         }
-      }catch{}
-      // Regardless of fetch outcome, check if good non-synthetic cache exists
-      if(!optionsLoaded){
+      }catch{_tickerFetchFailed=true;}
+      // Fallback safety net -- runs for either a total fetch failure or a
+      // ticker-level write failure (nothing fresh was persisted in either
+      // case, so falling back to "is there ANY usable, possibly-older
+      // cache" is the right question). Does NOT run when it was specifically
+      // a per-expiration write that failed while the ticker-level write
+      // succeeded: that case would almost always find the metadata we just
+      // wrote and silently flip optionsLoaded back to true, masking exactly
+      // the failure being tracked.
+      if(!optionsLoaded&&(_tickerFetchFailed||_tickerWriteFailed)){
         const _fallback=S.get('options_'+t);
         if(_fallback&&!_fallback.synthetic)optionsLoaded=true;
       }

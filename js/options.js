@@ -15,8 +15,20 @@ function _getQualifyingFomcMeetings(){
   const cf=S.get('fed_futures');
   const fedFutures=cf?.data||null;
   if(!fedFutures||typeof _computeFedMeetingProbabilities!=='function')return[];
+  // Read the same cached EFFR rows the Market tab itself uses. Without
+  // this, a past meeting the Market tab already resolved via the NY Fed's
+  // official data would get silently re-resolved here via the weaker
+  // futures-implied method and could overwrite that official history
+  // entry -- exactly the kind of contamination the NY-Fed-source fix was
+  // meant to eliminate, just reintroduced through this second call site.
+  // (_computeFedMeetingProbabilities also now refuses that downgrade on
+  // its own regardless of what a caller passes -- see market.js -- but
+  // passing the real data here means this call gets the best answer
+  // rather than just failing safe.)
+  const ce=S.get('fomc_effr_cache');
+  const effrRows=ce?.rows||[];
   let meetings=[];
-  try{meetings=_computeFedMeetingProbabilities(fedFutures)||[];}catch{return[];}
+  try{meetings=_computeFedMeetingProbabilities(fedFutures,effrRows)||[];}catch{return[];}
   return meetings.map(m=>{
     const direction=m.pCut25>m.pHold?'cut':m.pHike25>m.pHold?'hike':null;
     if(!direction)return null;
@@ -30,11 +42,40 @@ function _getQualifyingFomcMeetings(){
 // Strips the optionChain wrapper, unused fields (inTheMoney, expiration, hasMiniOptions),
 // and shortens field names to save ~10KB per expiry cache entry.
 // Readers must use .puts/.calls directly on the cache object.
+// Strike is load-bearing (it's how a contract gets found/matched
+// elsewhere) -- a contract with an invalid one is dropped entirely
+// rather than kept with a patched-up value. Every other numeric field
+// defaults to 0 when invalid, not null: several render paths call
+// .toFixed()/.toLocaleString() directly on these fields with no guard,
+// and 0 is safe there in every case, while null crashes the ones that
+// don't do arithmetic on the value first (r.bid.toFixed(2) does;
+// (r.iv*100).toFixed(1) doesn't, since the multiplication coerces
+// null to 0 before .toFixed() is ever called on it -- an inconsistency
+// not worth relying on when a single safe default covers every case).
+function _slimContract(c){
+  const s=Number(c.strike);
+  if(!Number.isFinite(s)||s<=0)return null;
+  const safeNum=(x,max)=>{
+    const n=Number(x);
+    return(Number.isFinite(n)&&n>=0&&n<=max)?n:0;
+  };
+  return{
+    s,
+    b:safeNum(c.bid,100000),
+    a:safeNum(c.ask,100000),
+    l:safeNum(c.lastPrice,100000),
+    oi:safeNum(c.openInterest,1e8),
+    v:safeNum(c.volume,1e8),
+    iv:safeNum(c.impliedVolatility,100),
+  };
+}
 function slimExpData(data){
   const opts=data?.optionChain?.result?.[0]?.options?.[0];
   if(!opts)return null;
-  const slim=c=>({s:c.strike,b:c.bid,a:c.ask,l:c.lastPrice,oi:c.openInterest,v:c.volume,iv:c.impliedVolatility});
-  return{puts:(opts.puts||[]).map(slim),calls:(opts.calls||[]).map(slim)};
+  return{
+    puts:(opts.puts||[]).map(_slimContract).filter(Boolean),
+    calls:(opts.calls||[]).map(_slimContract).filter(Boolean),
+  };
 }
 
 // Expand a slimmed per-expiry cache entry back to a contract object for readers.
@@ -81,6 +122,35 @@ function _validateOptionsData(data){
     return{valid:false,reason:'synthetic data: '+Math.round(zeroBidAsk/allContracts.length*100)+'% zero bid/ask'};
   }
 
+  // Basic per-field sanity, not just synthetic-PATTERN detection above --
+  // a chain could pass both checks above while still containing garbage
+  // in individual fields (NaN slipping through from a malformed response,
+  // a strike of 0 or negative, or an IV so extreme it can only be
+  // corrupted data rather than a real quote, even for a genuinely
+  // volatile name). Same ratio-based approach as the checks above: a FEW
+  // odd contracts within an otherwise-normal chain isn't flagged (real
+  // chains sometimes have a stray bad print), but a chain where this is
+  // pervasive is rejected outright, same as the synthetic-pattern cases.
+  const badStrikes=allContracts.filter(c=>!(Number.isFinite(c.strike)&&c.strike>0)).length;
+  if(allContracts.length>=3&&badStrikes/allContracts.length>0.2){
+    return{valid:false,reason:'invalid data: '+Math.round(badStrikes/allContracts.length*100)+'% non-positive or non-finite strikes'};
+  }
+  const nonFiniteQuote=allContracts.filter(c=>
+    (c.bid!=null&&!Number.isFinite(c.bid))||
+    (c.ask!=null&&!Number.isFinite(c.ask))||
+    (c.impliedVolatility!=null&&!Number.isFinite(c.impliedVolatility))
+  ).length;
+  if(allContracts.length>=3&&nonFiniteQuote/allContracts.length>0.2){
+    return{valid:false,reason:'invalid data: '+Math.round(nonFiniteQuote/allContracts.length*100)+'% non-finite bid/ask/IV'};
+  }
+  // 20.0 = 2000% IV -- generous enough to never flag genuinely volatile
+  // names (even extreme earnings-week or meme-stock IV rarely reaches
+  // this), narrow enough to catch a clearly corrupted value.
+  const extremeIV=allContracts.filter(c=>c.impliedVolatility!=null&&Number.isFinite(c.impliedVolatility)&&c.impliedVolatility>20).length;
+  if(allContracts.length>=3&&extremeIV/allContracts.length>0.2){
+    return{valid:false,reason:'invalid data: '+Math.round(extremeIV/allContracts.length*100)+'% implausibly extreme IV'};
+  }
+
   return{valid:true,reason:'ok'};
 }
 
@@ -94,9 +164,18 @@ function _isOptionsLiveWindow(){
     const now=new Date();
     const etFmt=new Intl.DateTimeFormat('en-US',{
       timeZone:'America/New_York',
-      hour:'numeric',minute:'numeric',hour12:false
+      weekday:'short',hour:'numeric',minute:'numeric',hour12:false
     });
     const parts=etFmt.formatToParts(now);
+    const etWeekday=parts.find(p=>p.type==='weekday').value;
+    // Markets are closed all day Saturday/Sunday regardless of clock time --
+    // without this check, a Sunday afternoon (or Saturday) falling within
+    // the normal 9:30am-cutoff window would be treated as a live trading
+    // window, when it never is. This doesn't change what gets WRITTEN
+    // (an invalid weekend fetch still correctly ends up preserving existing
+    // cache either way, just via a different branch/log message), but the
+    // function's own name should actually mean what it says.
+    if(etWeekday==='Sat'||etWeekday==='Sun')return false;
     const etHour=parseInt(parts.find(p=>p.type==='hour').value);
     const etMin=parseInt(parts.find(p=>p.type==='minute').value);
     const etMins=etHour*60+etMin;
@@ -112,11 +191,10 @@ function _isOptionsLiveWindow(){
 function _hasGoodSameDayCache(cacheKey){
   const existing=S.get(cacheKey);
   if(!existing||existing.synthetic)return false;
-  const ts=existing.ts;
-  if(!ts)return false;
+  const _wEpoch=_recEpoch(existing);
+  if(_wEpoch==null)return false;
   try{
-    const written=new Date(String(ts).replace(/ PT$| UTC$| local$/,'').trim());
-    if(isNaN(written.getTime()))return false;
+    const written=new Date(_wEpoch);
     // Good cache is valid until the NEXT trading session's live window opens
     // (9:30am ET on the next trading day). Until then, preserve it.
     // Strategy: if we are currently outside the live window, the cache written
@@ -152,10 +230,9 @@ function _shouldSkipOptionsFetch(cacheKey){
   try{
     const existing=S.get(cacheKey);
     if(!existing||existing.synthetic)return false; // no cache or synthetic -- must fetch
-    const ts=existing.ts;
-    if(!ts)return false;
-    const written=new Date(String(ts).replace(/ PT$| UTC$| local$/,'').trim());
-    if(isNaN(written.getTime()))return false;
+    const _wEpoch=_recEpoch(existing);
+    if(_wEpoch==null)return false;
+    const written=new Date(_wEpoch);
 
     const now=new Date();
     const ageMs=now.getTime()-written.getTime();
@@ -338,9 +415,17 @@ async function loadOptionsForTicker(){
           // The window check was designed to block synthetic after-hours placeholder
           // data, but _validateOptionsData already catches that. If validation passes,
           // the data is real and should always overwrite stale cache.
-          S.set('options_'+t,{data:slimOptionsData(data),ts:fetchTs,tsEpoch:fetchTsEpoch});
+          const _wrote=S.set('options_'+t,{data:slimOptionsData(data),ts:fetchTs,tsEpoch:fetchTsEpoch});
           _fetchedLive=true;
-          _debugPath='live fetch valid -- wrote fresh cache (ts: '+fetchTs+')';
+          // isLive drives the display: whether the "Cached options from..."
+          // banner shows, and whether the stale-underlying-price warning below
+          // is even checked. Was declared but never set true anywhere -- fresh
+          // data always showed as cached, and the price-staleness warning was
+          // dead code. Tied to the write actually succeeding, not just
+          // validation passing, so a quota failure still shows as cached
+          // rather than falsely claiming this render reflects fresh data.
+          isLive=_wrote;
+          _debugPath='live fetch valid -- wrote fresh cache (ts: '+fetchTs+')'+(_wrote?'':' [cache write failed -- see toast]');
         }else if(!_inWindow&&_hasSameDay){
           // Outside window AND validation failed -- preserve same-day cache
           // since the fresh fetch is synthetic/empty and we have something better.
@@ -356,7 +441,7 @@ async function loadOptionsForTicker(){
       }catch(e){const cached=S.get('options_'+t);if(cached){data=cached.data;isLive=false;fetchTs=cached.ts;fetchTsEpoch=cached.tsEpoch;showOfflineBanner(cached.ts,cached.tsEpoch);_debugPath='fetch threw ('+(e?.message||'unknown error')+') -- fell back to cache';}else throw new Error('No options data available');}
     }
     if(S.get('debug_options_fetch')==='true')toast(t+' options: '+_debugPath,6000);
-    currentOptionsData=data;
+    currentOptionsData=slimOptionsData(data);
     const yr=data?.optionChain?.result?.[0];
     // Keep original Unix timestamps alongside date strings so we can pass
     // the exact timestamp back to Yahoo when fetching per-expiration data.
@@ -414,8 +499,13 @@ async function loadOptionsForTicker(){
     }).join('');
     document.getElementById('exp-section').style.display='block';
     loadOptionsPrefs();
-    // Check for OI data availability -- show amber box if missing
-    const hasOI=yr?.options?.[0]?.puts?.some(p=>(p.openInterest||0)>0)||yr?.options?.[0]?.calls?.some(c=>(c.openInterest||0)>0);
+    // Check for OI data availability -- show amber box if missing. Uses
+    // the per-expiration cache for the nearest just-fetched monthly date
+    // directly (monthly[0]), rather than yr's own embedded data -- the
+    // main chain cache no longer carries embedded contract data at all
+    // (see slimOptionsData), only ticker-level metadata.
+    const _nearCheck=monthly.length?S.get('options_exp_'+t+'_'+monthly[0]):null;
+    const hasOI=_nearCheck?(_expPuts(_nearCheck).some(p=>(p.openInterest||0)>0)||_expCalls(_nearCheck).some(c=>(c.openInterest||0)>0)):false;
     if(!hasOI){
       const lastGood=S.get('options_'+t);
       document.getElementById('options-content').innerHTML=`<div class="oi-empty-box">Open Interest data is currently unavailable. This is normal when markets are closed -- OI data typically refreshes when the market opens the following business day.${lastGood?.ts?` Last known data: ${lastGood.ts} (${relAge(lastGood.ts,lastGood.tsEpoch)}).`:''} Load the options chain and the table will still show strikes and premiums; OI will appear as 0 until data refreshes.</div>`;
@@ -428,8 +518,8 @@ async function loadOptionsForTicker(){
     if(isLive&&snapTs){
       try{
         const optAge=0;// just fetched
-        const snapD=new Date(snapTs.replace(/ PT$| UTC$| local$/,'').trim());
-        const snapAgeMins=isNaN(snapD.getTime())?0:(Date.now()-snapD.getTime())/60000;
+        const _snapEp=_recEpoch(S.get('snap_'+t));
+        const snapAgeMins=_snapEp==null?0:(Date.now()-_snapEp)/60000;
         if(snapAgeMins>30){
           document.getElementById('options-content').innerHTML+=
             '<div style="background:rgba(255,165,2,0.08);border:1px solid rgba(255,165,2,0.3);border-radius:8px;padding:8px 12px;font-family:var(--mono);font-size:11px;color:var(--warn);margin-bottom:8px">'
@@ -481,7 +571,18 @@ function buildOptionsTable(){
   const hlApy=parseFloat(document.getElementById('highlight-apy').value)||12;
   const today=new Date();const rows=[];
   for(const exp of selectedExpirations){
-    const expCached=S.get('options_exp_'+t+'_'+exp);if(!expCached)continue;
+    let expCached=S.get('options_exp_'+t+'_'+exp);
+    if(!expCached){
+      // Pre-472 tickers have no per-expiration entries at all -- fall back to
+      // the ticker-level metadata's own embedded chain (see _legacyEmbeddedExp
+      // in helpers.js) when its expiration matches the one being rendered, so
+      // the table isn't silently empty for a ticker that hasn't been
+      // re-fetched since the options-cache consolidation. _expPuts/_expCalls
+      // below already understand this shape.
+      const _legacy=_legacyEmbeddedExp(S.get('options_'+t));
+      if(_legacy&&_legacy.date===exp)expCached=_legacy.entry;
+    }
+    if(!expCached)continue;
     const expD=new Date(exp+'T12:00:00Z');const dte=Math.max(Math.round((expD-today)/86400000),1);
     const proc=(contracts,isCall)=>{if(!contracts)return;contracts.forEach(o=>{const s=o.strike||0;if(s<lowerBound||s>upperBound)return;const bid=o.bid||0,ask=o.ask||0,last=o.lastPrice||0,oi=o.openInterest||0,vol=o.volume||0,iv=o.impliedVolatility||0;const premium=(bid>0?bid:last)*100;const apy=isCall?premium/(currentPrice*100)*(365/dte)*100:premium/(s*100)*(365/dte)*100;const pctOTM=isCall?(s-currentPrice)/currentPrice*100:(currentPrice-s)/currentPrice*100;rows.push({expDate:exp,strike:s,bid,ask,last,premium,apy,oi,vol,iv,dte,pctOTM});});};
     if(currentMode==='puts')proc(_expPuts(expCached),false);else proc(_expCalls(expCached),true);
@@ -611,9 +712,8 @@ function buildOptionsTable(){
     // itself guards against); falls back to string comparison only for
     // legacy entries written before tsEpoch existed.
     return _expEntries.reduce((oldest,e)=>{
-      if(oldest.tsEpoch!=null&&e.tsEpoch!=null)return e.tsEpoch<oldest.tsEpoch?e:oldest;
-      const _od=new Date((oldest.ts||'').replace(/ PT$| UTC$| local$/,'').trim());
-      const _td=new Date((e.ts||'').replace(/ PT$| UTC$| local$/,'').trim());
+      const _od=_recEpoch(oldest),_td=_recEpoch(e); // epoch when present, legacy string parse otherwise
+      if(_od==null||_td==null)return oldest;
       return _td<_od?e:oldest;
     });
   })();
@@ -640,9 +740,8 @@ function renderOIChart(rows,currentPrice,t){
       return{ts:cached?.ts||'',tsEpoch:cached?.tsEpoch};
     }
     return _expEntries.reduce((oldest,e)=>{
-      if(oldest.tsEpoch!=null&&e.tsEpoch!=null)return e.tsEpoch<oldest.tsEpoch?e:oldest;
-      const _od=new Date((oldest.ts||'').replace(/ PT$| UTC$| local$/,'').trim());
-      const _td=new Date((e.ts||'').replace(/ PT$| UTC$| local$/,'').trim());
+      const _od=_recEpoch(oldest),_td=_recEpoch(e); // epoch when present, legacy string parse otherwise
+      if(_od==null||_td==null)return oldest;
       return _td<_od?e:oldest;
     });
   })();

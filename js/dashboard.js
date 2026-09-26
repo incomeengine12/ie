@@ -112,7 +112,7 @@ function renderDashTable(elId,results,ts,isLive){
       +'<div style="text-align:right"><div style="font-family:var(--mono);font-size:11px;font-weight:600">'+r.signal.toUpperCase()+(sc!==''?' &middot; '+sc:'')+'</div>'+(r.ivrBadge||'')+'</div>'
       +'</div>'
       +renderCompBars(comps)
-      +(rs?'<div style="display:flex;gap:16px;margin-bottom:8px;font-family:var(--mono)"><div><span style="font-size:9px;color:var(--text3);display:block">REC STRIKE</span><span style="font-size:14px">'+rs+'</span></div>'+(exp?'<div><span style="font-size:9px;color:var(--text3);display:block">EXPIRY</span><span style="font-size:12px;color:var(--text2)">'+exp+'</span></div>':'')+(apy?'<div><span style="font-size:9px;color:var(--text3);display:block">EST APY</span><span style="font-size:14px;color:var(--accent)">'+apy+'</span></div>':'')+'</div>':'')
+      +(rs?'<div style="display:flex;gap:16px;margin-bottom:8px;font-family:var(--mono)"><div><span style="font-size:9px;color:var(--text3);display:block">REC STRIKE</span><span style="font-size:14px">'+rs+'</span></div>'+(exp?'<div><span style="font-size:9px;color:var(--text3);display:block">EXPIRY</span><span style="font-size:12px;color:var(--text2)">'+exp+'</span></div>':'')+(apy?'<div><span style="font-size:9px;color:var(--text3);display:block">EST APY</span><span style="font-size:14px;color:var(--accent)">'+apy+(r.belowFloor?' (below target)':'')+'</span></div>':'')+'</div>':'')
       +(r.earningsDate?'<div style="font-family:var(--mono);font-size:11px;color:var(--warn);margin-bottom:6px">Earnings '+r.earningsDate+'</div>':'')
       +(r.narrative?'<div style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.6;border-top:1px solid rgba(255,255,255,0.05);padding-top:8px;margin-top:4px">'+r.narrative+'</div>':'')
       +'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:6px;text-align:right">Tap to analyze</div>'
@@ -134,7 +134,7 @@ function runDashboards(){
   document.getElementById('dashboard-progress').style.display='block';
   document.getElementById('dash-progress-bar').style.width='0%';
   document.getElementById('dash-progress-label').textContent='Scoring from cache...';
-  const targetAPY=parseFloat(document.getElementById('target-apy').value)||12;
+  const targetAPY=finiteNumber(document.getElementById('target-apy').value,{min:0,max:500,fallback:12});
   const putResults=[],ccResults=[];
   const today=new Date();
   for(let i=0;i<watchlist.length;i++){
@@ -172,29 +172,65 @@ function runDashboards(){
       const earningsTiming=earningsHour==='bmo'?' (before open)':earningsHour==='amc'?' (after close)':'';
       const earningsDisplay=earningsDate?earningsDate+earningsTiming:null;
 
-      // Options: best put and call strikes from cached per-expiry chains
-      let pRS=null,pExp=null,pApy=null,cRS=null,cExp=null,cApy=null;
+      // Options: best put and call strikes from cached per-expiry chains.
+      // Selection philosophy: among real, liquid, in-band candidates, prefer
+      // the most-conservative (furthest OTM) strike that still clears a full
+      // targetAPY floor -- not the nearest match to targetAPY. If nothing in
+      // the nearest qualifying expiry clears the floor, fall back to the best
+      // available candidate there (highest realizable APY) rather than
+      // showing nothing, flagged as below-target. A later expiry that DOES
+      // clear the floor overrides an earlier fallback. Scans the full
+      // expiration list within the DTE window, not just the first 3 dates.
+      let pRS=null,pExp=null,pApy=null,pBelowFloor=false,pQualified=false;
+      let cRS=null,cExp=null,cApy=null,cBelowFloor=false,cQualified=false;
       try{
         const oc=S.get('options_'+t);
         const yr=oc?.data?.optionChain?.result?.[0];
         if(yr&&price){
           const expDates=(yr.expirationDates||[]).map(ts=>new Date(ts*1000).toISOString().split('T')[0]);
-          for(const exp of expDates.slice(0,3)){
+          for(const exp of expDates){
             const ec=S.get('options_exp_'+t+'_'+exp);
-            const res=ec?.optionChain?.result?.[0];
-            if(!res)continue;
+            if(!ec)continue;
             const expD=new Date(exp+'T12:00:00Z');
             const dte=Math.max(Math.round((expD-today)/86400000),1);
             if(dte<25||dte>100)continue;
-            if(!pRS&&res.options?.[0]?.puts){
-              const puts=res.options[0].puts.filter(p=>{const s=p.strike,bid=p.bid||0,last=p.lastPrice||0,prem=(bid>0?bid:last)*100,apy=prem/(s*100)*(365/dte)*100,pct=(price-s)/price*100;return s<price&&pct>=4&&pct<=18&&apy>=targetAPY*0.7&&(p.openInterest||0)>=50;});
-              if(puts.length){const best=puts.reduce((b,p)=>{const apyA=((p.bid||0)>0?p.bid:p.lastPrice||0)*100/(p.strike*100)*(365/dte)*100;const apyB=((b.bid||0)>0?b.bid:b.lastPrice||0)*100/(b.strike*100)*(365/dte)*100;return Math.abs(apyA-targetAPY)<Math.abs(apyB-targetAPY)?p:b;});const prem=((best.bid||0)>0?best.bid:best.lastPrice||0)*100;pRS='$'+formatStrike(best.strike);pExp=exp;pApy=(prem/(best.strike*100)*(365/dte)*100).toFixed(1)+'%';}
+            if(!pQualified){
+              const puts=_expPuts(ec);
+              if(puts.length){
+                const apyOfPut=p=>((p.bid||0)>0?p.bid:p.lastPrice||0)*100/(p.strike*100)*(365/dte)*100;
+                const candidates=puts.filter(p=>{const pct=(price-p.strike)/price*100;return p.strike<price&&pct>=4&&pct<=18&&(p.openInterest||0)>=50;});
+                if(candidates.length){
+                  const floorClearing=candidates.filter(p=>apyOfPut(p)>=targetAPY);
+                  if(floorClearing.length){
+                    // Most conservative = most OTM = lowest strike among those clearing the floor.
+                    const best=floorClearing.reduce((b,p)=>p.strike<b.strike?p:b);
+                    pRS='$'+formatStrike(best.strike);pExp=exp;pApy=apyOfPut(best).toFixed(1)+'%';pQualified=true;pBelowFloor=false;
+                  }else if(!pRS){
+                    const best=candidates.reduce((b,p)=>apyOfPut(p)>apyOfPut(b)?p:b);
+                    pRS='$'+formatStrike(best.strike);pExp=exp;pApy=apyOfPut(best).toFixed(1)+'%';pBelowFloor=true;
+                  }
+                }
+              }
             }
-            if(!cRS&&res.options?.[0]?.calls){
-              const calls=res.options[0].calls.filter(c=>{const s=c.strike,bid=c.bid||0,last=c.lastPrice||0,prem=(bid>0?bid:last)*100,apy=prem/(price*100)*(365/dte)*100,pct=(s-price)/price*100;return s>price&&pct>=4&&pct<=18&&apy>=targetAPY*0.7&&(c.openInterest||0)>=50;});
-              if(calls.length){const best=calls.reduce((b,c)=>{const apyA=((c.bid||0)>0?c.bid:c.lastPrice||0)*100/(price*100)*(365/dte)*100;const apyB=((b.bid||0)>0?b.bid:b.lastPrice||0)*100/(price*100)*(365/dte)*100;return Math.abs(apyA-targetAPY)<Math.abs(apyB-targetAPY)?c:b;});const prem=((best.bid||0)>0?best.bid:best.lastPrice||0)*100;cRS='$'+formatStrike(best.strike);cExp=exp;cApy=(prem/(price*100)*(365/dte)*100).toFixed(1)+'%';}
+            if(!cQualified){
+              const calls=_expCalls(ec);
+              if(calls.length){
+                const apyOfCall=c=>((c.bid||0)>0?c.bid:c.lastPrice||0)*100/(price*100)*(365/dte)*100;
+                const candidates=calls.filter(c=>{const pct=(c.strike-price)/price*100;return c.strike>price&&pct>=4&&pct<=18&&(c.openInterest||0)>=50;});
+                if(candidates.length){
+                  const floorClearing=candidates.filter(c=>apyOfCall(c)>=targetAPY);
+                  if(floorClearing.length){
+                    // Most conservative = most OTM = highest strike among those clearing the floor.
+                    const best=floorClearing.reduce((b,c)=>c.strike>b.strike?c:b);
+                    cRS='$'+formatStrike(best.strike);cExp=exp;cApy=apyOfCall(best).toFixed(1)+'%';cQualified=true;cBelowFloor=false;
+                  }else if(!cRS){
+                    const best=candidates.reduce((b,c)=>apyOfCall(c)>apyOfCall(b)?c:b);
+                    cRS='$'+formatStrike(best.strike);cExp=exp;cApy=apyOfCall(best).toFixed(1)+'%';cBelowFloor=true;
+                  }
+                }
+              }
             }
-            if(pRS&&cRS)break;
+            if(pQualified&&cQualified)break;
           }
         }
       }catch{}
@@ -202,16 +238,17 @@ function runDashboards(){
       // OI gravity gap
       let oiGapPct=null,callOiGapPct=null;
       try{
-        const opts=S.get('options_'+t)?.data?.optionChain?.result?.[0];
-        if(opts&&price>0){
-          const near=opts.options?.[0];
-          if(near?.puts?.length){const maxP=near.puts.reduce((b,p)=>(!b||(p.openInterest||0)>(b.openInterest||0))?p:b,null);if(maxP?.strike)oiGapPct=(price-maxP.strike)/price*100;}
-          if(near?.calls?.length){const maxC=near.calls.filter(c=>c.strike>price).reduce((b,c)=>(!b||(c.openInterest||0)>(b.openInterest||0))?c:b,null);if(maxC?.strike)callOiGapPct=(maxC.strike-price)/price*100;}
+        const nearEntry=_nearestExpEntry(t);
+        if(nearEntry&&price>0){
+          const nearPuts=_expPuts(nearEntry),nearCalls=_expCalls(nearEntry);
+          if(nearPuts.length){const maxP=nearPuts.reduce((b,p)=>(!b||(p.openInterest||0)>(b.openInterest||0))?p:b,null);if(maxP?.strike)oiGapPct=(price-maxP.strike)/price*100;}
+          if(nearCalls.length){const maxC=nearCalls.filter(c=>c.strike>price).reduce((b,c)=>(!b||(c.openInterest||0)>(b.openInterest||0))?c:b,null);if(maxC?.strike)callOiGapPct=(maxC.strike-price)/price*100;}
         }
       }catch{}
 
       const ps=scorePuts({price,rsiVal,ma50,ma200,rangePos,earningsDate:earningsDisplay,recStrike:pRS,expiration:pExp,estApy:pApy,ivrVal,ptMean:snap.ptMean||null,beta:snap.beta||null,oiGapPct});
       const cs=scoreCalls({price,rsiVal,ma50,ma200,rangePos,earningsDate:earningsDisplay,recStrike:cRS,expiration:cExp,estApy:cApy,ivrVal,ptMean:snap.ptMean||null,beta:snap.beta||null,oiGapPct:callOiGapPct});
+      ps.belowFloor=pBelowFloor;cs.belowFloor=cBelowFloor;
       const common={ticker:t,price,ivrBadge:ivr.badge,ivrVal,earningsDate:earningsDisplay};
       putResults.push({...common,...ps});ccResults.push({...common,...cs});
     }catch(err){
@@ -564,20 +601,40 @@ function _populateGapFillDropdown(){
 }
 
 // Shared block for one direction's (up/down) fill-rate summary -- same data
-// shape used by both the aggregate and individual-ticker views.
+// shape used by both the aggregate and individual-ticker views. Reports
+// FIXED-HORIZON outcomes (each computed only over gaps old enough to have
+// actually been observable at that horizon) rather than a single
+// all-ages-pooled fill rate/average -- see _gapHorizonStat in helpers.js
+// for why the pooled version is statistically biased.
 function _gapFillDirectionHtml(label,color,data){
   if(!data||!data.count){
     return `<div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:10px">${label}: no qualifying gaps found in the available history.</div>`;
   }
-  const fillStr=data.fillRate!=null?data.fillRate.toFixed(0)+'%':'--';
-  const avgDaysStr=data.avgDaysToFill!=null?data.avgDaysToFill.toFixed(1)+' days avg':'--';
-  return `<div style="margin-bottom:14px">
-    <div style="font-family:var(--mono);font-size:11px;font-weight:600;color:${color};margin-bottom:4px">${label} -- ${data.count} gap${data.count!==1?'s':''}</div>
-    <div style="display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:11px;padding:3px 0;border-bottom:1px solid var(--surface3)">
-      <span style="color:var(--text2)">Filled</span>
+  const row=(lbl,stat)=>{
+    const pctStr=stat.filledPct!=null?stat.filledPct.toFixed(0)+'%':'--';
+    const sampleStr=stat.eligible?`${stat.filledCount} / ${stat.eligible}`:'no gaps old enough yet';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:11px;padding:3px 0;border-bottom:1px solid var(--surface3)">
+      <span style="color:var(--text2)">${lbl}</span>
       <span style="text-align:right">
-        <span style="color:var(--text);font-weight:600">${data.filledCount} / ${data.count} (${fillStr})</span>
-        <span style="color:var(--text3);display:block;font-size:10px">${avgDaysStr}, when filled</span>
+        <span style="color:var(--text);font-weight:600">${pctStr}</span>
+        <span style="color:var(--text3);display:block;font-size:10px">${sampleStr}</span>
+      </span>
+    </div>`;
+  };
+  const h=data.horizons;
+  const stillOpenStr=h.within60.eligible?h.within60.openPct.toFixed(0)+'%':'--';
+  const stillOpenSample=h.within60.eligible?`${h.within60.openCount} / ${h.within60.eligible}`:'no gaps old enough yet';
+  return `<div style="margin-bottom:14px">
+    <div style="font-family:var(--mono);font-size:11px;font-weight:600;color:${color};margin-bottom:4px">${label} -- ${data.count} gap${data.count!==1?'s':''} (${data.filledCount} filled to date)</div>
+    ${row('Filled same day',h.sameDay)}
+    ${row('Filled within 5 trading days',h.within5)}
+    ${row('Filled within 20 trading days',h.within20)}
+    ${row('Filled within 60 trading days',h.within60)}
+    <div style="display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:11px;padding:3px 0">
+      <span style="color:var(--text2)">Still open past 60 trading days</span>
+      <span style="text-align:right">
+        <span style="color:var(--warn);font-weight:600">${stillOpenStr}</span>
+        <span style="color:var(--text3);display:block;font-size:10px">${stillOpenSample}</span>
       </span>
     </div>
   </div>`;

@@ -80,7 +80,7 @@ function _openNoteModal(ticker){
     '<div class="modal-box" style="max-height:80vh;overflow-y:auto">'+
       '<div class="modal-title modal-title-neutral">Note for '+ticker+'</div>'+
       '<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">Appears below the ticker row. Max 500 characters.</div>'+
-      '<textarea id="wnm-text" maxlength="500" rows="8" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--mono);font-size:12px;padding:8px;resize:none;outline:none">'+existing.replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</textarea>'+
+      '<textarea id="wnm-text" maxlength="500" rows="8" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--mono);font-size:12px;padding:8px;resize:none;outline:none">'+_escHtml(existing)+'</textarea>'+
       '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">'+
         '<span id="wnm-counter" style="font-family:var(--mono);font-size:9px;color:var(--text3)">'+existing.length+'/500</span>'+
         '<div id="wnm-btns" style="display:flex;gap:8px">'+
@@ -400,7 +400,7 @@ function _confirmRemove(){
   // every removed ticker orphaned in localStorage forever (a real storage leak).
   ['options_','hist2y_','intraday_','news_','upgrades_',
    'earnings_hist_','earnings_confirmed_','earnings_pending_',
-   'rp_compare_','watchlist_note_'].forEach(prefix=>S.del(prefix+ticker));
+   'rp_compare_','watchlist_note_','div_hist_'].forEach(prefix=>S.del(prefix+ticker));
   // options_exp_<ticker>_<date> has a date suffix, so it needs a prefix scan
   try{
     const _expPrefix='options_exp_'+ticker+'_';
@@ -853,7 +853,7 @@ function renderWatchlist(){
       (gapBadge?'<div style="width:100%;margin-top:4px">'+gapBadge+'</div>':'')+
       (note?
         '<div onclick="event.stopPropagation();_toggleNoteExpand(\''+t+'\')" style="width:100%;margin-top:6px;padding-top:6px;border-top:1px solid var(--border);font-family:var(--mono);font-size:10px;color:var(--text2);cursor:pointer;display:flex;align-items:flex-start;gap:4px">'+
-          '<span style="flex:1;'+(expanded?'white-space:normal;word-break:break-word':'white-space:nowrap;overflow:hidden;text-overflow:ellipsis')+'">'+note.replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</span>'+
+          '<span style="flex:1;'+(expanded?'white-space:normal;word-break:break-word':'white-space:nowrap;overflow:hidden;text-overflow:ellipsis')+'">'+_escHtml(note)+'</span>'+
           '<span style="flex-shrink:0;color:var(--text3);font-size:8px;padding-top:1px">'+(expanded?'▲':'▼')+'</span>'+
         '</div>'
       :'')+
@@ -872,8 +872,8 @@ function navigateToTicker(t){
 
 function addTicker(){
   const inp=document.getElementById('new-ticker-input');
-  const t=inp.value.trim().toUpperCase();
-  if(!t)return;
+  const t=normalizeTicker(inp.value);
+  if(!t){if(inp.value.trim())toast('Not a valid ticker symbol');return;}
   if(watchlist.includes(t)){toast(t+' already in watchlist');return;}
   watchlist.push(t);S.set('watchlist',watchlist);
   inp.value='';renderWatchlist();populateSelects();toast('Added '+t);
@@ -883,7 +883,7 @@ function populateSelects(){
   // Dropdowns always alphabetical regardless of watchlist chip sort order
   const sorted=[...watchlist].sort((a,b)=>a.localeCompare(b));
   const opts='<option value="">-- Select --</option>'+
-    sorted.map(t=>'<option value="'+t+'">'+t+'</option>').join('');
+    sorted.map(t=>'<option value="'+_escHtml(t)+'">'+_escHtml(t)+'</option>').join('');
   document.getElementById('ticker-select').innerHTML=opts;
   document.getElementById('options-ticker-select').innerHTML=opts;
 }

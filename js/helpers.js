@@ -3,6 +3,76 @@
 // Globals used: tzPref, S, watchlist, WORKER_URL, vixThreshold
 // Dependencies: storage.js (S)
 
+// Escapes text pulled from a remote/cached source (news headlines, summaries,
+// sources) before it's interpolated into an HTML template string. Every news
+// item comes from an external API response that gets cached locally and
+// replayed on every later view -- without this, a crafted or corrupted
+// headline becomes stored, repeatedly-executed HTML. Covers the five
+// characters that matter inside HTML text/attribute context; String(x) so a
+// non-string (null/number) never throws.
+function _escHtml(s){
+  return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+// Central ticker validator -- every place a ticker string can enter the
+// app from outside (the watchlist add field, the default-watchlist
+// settings field, and anywhere else a raw string might end up as a
+// ticker) should go through this rather than just trim+uppercase. A
+// ticker with quotes or HTML in it can break markup, inject an
+// attribute, or corrupt a storage key, since ticker strings get
+// interpolated into option elements, inline onclick handlers, storage
+// keys, and proxy request URLs in various places throughout this app.
+// Allows the Yahoo symbol shapes actually used here: plain equities
+// (AAPL), tickers with a hyphen (BRK-B) or dot (BF.B), and caret-prefixed
+// indices (^GSPC, ^VIX). Returns null for anything that doesn't match --
+// callers should treat that as "not a valid ticker," not silently
+// truncate or strip characters, since silently mutating input the person
+// typed is its own kind of confusing.
+// Validates that a YYYY-MM-DD string is a REAL calendar date, not just
+// shaped like one. Deliberately not `!isNaN(new Date(str).getTime())` --
+// JS's Date parsing is lenient about day overflow (2026-02-30 silently
+// parses as 2026-03-02 rather than being rejected), which would let an
+// impossible date slip through undetected. Same logic as the Cloudflare
+// Worker's own _isValidISODate (cloudflare-proxy/worker.js) -- duplicated
+// rather than shared, since the Worker runs in a completely separate
+// runtime with no access to this app's own JS files.
+function _isValidISODate(str){
+  const m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+  if(!m)return false;
+  const y=+m[1],mo=+m[2],d=+m[3];
+  if(mo<1||mo>12)return false;
+  const daysInMonth=new Date(Date.UTC(y,mo,0)).getUTCDate();
+  return d>=1&&d<=daysInMonth;
+}
+
+// Validates a numeric input against a finite range, with a safe fallback
+// for anything that doesn't qualify -- NaN, Infinity/-Infinity, or a
+// value outside [min,max]. parseFloat()/Number() alone don't catch
+// Infinity (parseFloat('Infinity') is a real, finite-looking number to
+// naive `||fallback` truthiness checks, since Infinity is truthy), and
+// HTML's own min/max attributes only constrain normal UI interaction --
+// they don't protect a value that arrives another way (a restored
+// backup, a manually-edited field). Use this at any point a number is
+// actually being SAVED or APPLIED, not just displayed.
+function finiteNumber(value,{min=-Infinity,max=Infinity,fallback=null}={}){
+  const n=Number(value);
+  return Number.isFinite(n)&&n>=min&&n<=max?n:fallback;
+}
+
+function normalizeTicker(value){
+  const t=String(value==null?'':value).trim().toUpperCase();
+  return/^[A-Z0-9^.-]{1,15}$/.test(t)?t:null;
+}
+// A remote URL used as an href -- only http:/https: pass through (escaped);
+// anything else (javascript:, data:, a malformed string) is rejected so a
+// crafted news item can't turn a link into script execution. Returns null on
+// reject; callers render plain (non-linked) text in that case.
+function _safeHref(u){
+  try{
+    const p=new URL(String(u));
+    return(p.protocol==='http:'||p.protocol==='https:')?_escHtml(p.href):null;
+  }catch{return null;}
+}
+
 // Shared by _computeRSIBacktestForTicker and _computeRSIBacktestAggregate --
 // previously defined identically (as a closure over a local `closes`) in
 // both places. Takes closes explicitly so both call sites can share it.
@@ -112,6 +182,30 @@ function relAge(tsStr,epoch){
     if(diff<86400)return Math.round(diff/3600)+'h ago';
     return Math.round(diff/86400)+'d ago';
   }catch{return'';}
+}
+
+// Epoch-ms of a cache record's write time -- THE way freshness/age logic
+// should read a record's timestamp. Prefers tsEpoch (an absolute instant, so
+// immune to display-timezone preference, device timezone, travel and DST).
+// Falls back to parsing the display string `ts` only for legacy records
+// written before tsEpoch existed; that parse reads the wall-clock text in the
+// DEVICE's timezone, so it can be off by the tz difference for such records
+// (they age out on their own as they're rewritten). Accepts a record object,
+// a bare ts string, or null. Returns null when the time is unknown or
+// unparseable -- callers decide what "unknown" means for them.
+function _recEpoch(rec){
+  if(rec==null)return null;
+  if(typeof rec==='object'&&typeof rec.tsEpoch==='number'&&isFinite(rec.tsEpoch))return rec.tsEpoch;
+  const ts=typeof rec==='string'?rec:(typeof rec==='object'?rec.ts:null);
+  if(typeof ts!=='string'||!ts)return null;
+  const t=new Date(ts.replace(/ PT$| UTC$| local$/,'').trim()).getTime();
+  return isNaN(t)?null:t;
+}
+// Age in hours, or Infinity when unknown/unparseable -- the safe direction
+// for "is this stale enough to refetch?" gates (unknown age => refetch).
+function _recAgeHrs(rec){
+  const e=_recEpoch(rec);
+  return e==null?Infinity:(Date.now()-e)/3600000;
 }
 
 function tsChip(ts,isLive,epoch){
@@ -298,7 +392,7 @@ function _buildEarningsHistory(ticker){
         sorted.push({date:old.override.date,hour:old.override.hour,gapPct:null,direction:null,source:'manual-override',override:old.override});
       });
       sorted.sort((a,b)=>a.date.localeCompare(b.date));
-      S.set('earnings_hist_'+t,{data:sorted,ts:nowPT()});
+      S.set('earnings_hist_'+t,{data:sorted,ts:nowPT(),tsEpoch:Date.now()});
     }
   }catch{}
 }
@@ -339,6 +433,115 @@ function _resolvePostMarketFields(freshQuote,prevSnap){
   return{marketState:freshState,postMarketPrice:null,postMarketChange:null,postMarketChangePct:null};
 }
 
+// Cached per-expiration entries for a ticker, chronological:
+// [{date:'YYYY-MM-DD', entry}]. Which dates exist comes from the ticker's own
+// metadata cache (options_<ticker>'s expirationDates list -- metadata only as
+// of the consolidation that removed its embedded contract data, see
+// slimOptionsData in api.js); only dates that actually have an
+// options_exp_<ticker>_<date> entry are returned, since not every listed date
+// is fetched (roughly the next 3 monthlies are). `meta` may be passed to avoid
+// a second read.
+function _cachedExpEntries(ticker,meta){
+  if(meta===undefined)meta=S.get('options_'+ticker);
+  const expDates=meta?.data?.optionChain?.result?.[0]?.expirationDates;
+  const out=[];
+  if(!expDates||!expDates.length)return out;
+  for(const ts of [...expDates].sort((a,b)=>a-b)){
+    const date=new Date(ts*1000).toISOString().split('T')[0];
+    const entry=S.get('options_exp_'+ticker+'_'+date);
+    if(entry)out.push({date,entry});
+  }
+  return out;
+}
+
+// Compatibility for options_<ticker> entries written BEFORE build 472, which
+// embedded the nearest expiration's full contract data at
+// optionChain.result[0].options[0]. Newer writers store metadata only, but an
+// old entry can sit in storage until the next successful refresh rewrites it
+// (and until then no options_exp_ entries may exist for it). _expPuts /
+// _expCalls already read that shape, so the whole cached object works as an
+// entry. Returns {date,entry} -- date null if the embedded chain carries no
+// expirationDate -- or null when there is no usable embedded chain.
+function _legacyEmbeddedExp(meta){
+  const emb=meta?.data?.optionChain?.result?.[0]?.options?.[0];
+  if(!emb||!((emb.puts&&emb.puts.length)||(emb.calls&&emb.calls.length)))return null;
+  const date=Number.isFinite(emb.expirationDate)?new Date(emb.expirationDate*1000).toISOString().split('T')[0]:null;
+  return{date,entry:meta.data};
+}
+
+// {date,entry} for the nearest expiration currently cached for this ticker
+// (the very nearest LISTED date isn't always the one that's been fetched).
+// Falls back to a pre-472 embedded chain (see _legacyEmbeddedExp) only when
+// there are no per-expiration entries at all -- date is null there if the
+// embedded chain carries no expirationDate. Returns null when neither exists.
+function _nearestExpEntryDated(ticker){
+  const meta=S.get('options_'+ticker);
+  const list=_cachedExpEntries(ticker,meta);
+  if(list.length)return list[0];
+  return _legacyEmbeddedExp(meta);
+}
+
+// The options_exp_ entry (compact {puts,calls} shape) alone -- see
+// _nearestExpEntryDated when the expiration date is also needed.
+function _nearestExpEntry(ticker){
+  return _nearestExpEntryDated(ticker)?.entry??null;
+}
+
+// Does an option expiring on expDate ('YYYY-MM-DD') span an earnings report on
+// earnDate/earnHour? Options expire at the close, so an expiration strictly
+// AFTER the report date always spans it; one ON the report date spans it only
+// if the report comes before the close ('bmo' = before open, 'dmh' = during
+// market hours). 'amc' (after close) or an unknown hour does not count -- we
+// don't assume.
+function _expCoversEarnings(expDate,earnDate,earnHour){
+  if(typeof expDate!=='string'||typeof earnDate!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(earnDate))return false;
+  if(expDate>earnDate)return true;
+  return expDate===earnDate&&(earnHour==='bmo'||earnHour==='dmh');
+}
+
+// The first cached expiration that spans the given earnings report, as
+// {date,entry}, or null when none does (e.g. the report is beyond the last
+// cached expiration) -- callers then show nothing rather than a straddle that
+// doesn't contain the earnings move. Uses a DATED pre-472 embedded chain only
+// when there are no per-expiration entries at all.
+function _expEntryCovering(ticker,earnDate,earnHour){
+  const meta=S.get('options_'+ticker);
+  let list=_cachedExpEntries(ticker,meta);
+  if(!list.length){const lg=_legacyEmbeddedExp(meta);if(lg&&lg.date)list=[lg];}
+  return list.find(x=>_expCoversEarnings(x.date,earnDate,earnHour))||null;
+}
+
+// 'YYYY-MM-DD' -> 'Nov 20' for display.
+function _expLabel(dateStr){
+  const d=new Date(dateStr+'T12:00:00Z');
+  return isNaN(d.getTime())?String(dateStr):d.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'});
+}
+
+// At-the-money straddle from a cached per-expiration entry (see
+// _nearestExpEntry). Picks the strike CLOSEST TO SPOT that has a usable quote
+// on BOTH the put and the call (bid>0, ask>0, ask>=bid), so the two legs are
+// always the same strike -- a true straddle -- regardless of the order Yahoo
+// returned the chain in; ties go to the lower strike. Returns
+// {strike, straddle, offsetPct} (straddle = put mid + call mid, $/share), or
+// null when no such strike lies within maxOffsetPct of spot (callers then
+// show nothing rather than a misleading number).
+function _atmStraddle(entry,price,maxOffsetPct=3){
+  if(!entry||!Number.isFinite(price)||price<=0)return null;
+  const usable=q=>q&&Number.isFinite(q.strike)&&Number.isFinite(q.bid)&&Number.isFinite(q.ask)&&q.bid>0&&q.ask>0&&q.ask>=q.bid;
+  const callAt=new Map();
+  for(const c of _expCalls(entry))if(usable(c))callAt.set(c.strike,c);
+  let best=null;
+  for(const p of _expPuts(entry)){
+    if(!usable(p))continue;
+    const c=callAt.get(p.strike);
+    if(!c)continue;
+    const off=Math.abs(p.strike-price);
+    if(best===null||off<best.off||(off===best.off&&p.strike<best.p.strike))best={p,c,off};
+  }
+  if(!best||best.off/price>=maxOffsetPct/100)return null;
+  return{strike:best.p.strike,straddle:(best.p.bid+best.p.ask)/2+(best.c.bid+best.c.ask)/2,offsetPct:best.off/price*100};
+}
+
 // Returns today's date as 'YYYY-MM-DD' in US Eastern time -- the timezone
 // actual market/earnings events are anchored to (market open/close, BMO/AMC
 // timing). Used throughout the earnings pipeline in place of
@@ -348,6 +551,40 @@ function _resolvePostMarketFields(freshQuote,prevSnap){
 // timezone west of UTC.
 function _todayET(){
   return new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+}
+
+// Given TODAY's ET wall-clock report-time boundary -- 9:30am ET (market
+// open) for a bmo report, 4:00pm ET (market close) for amc -- returns the
+// precise UTC epoch ms. Reuses the same live-offset-detection technique as
+// _todayETStart() below. Only ever called for TODAY's own earnings event
+// (see _earningsFreshnessLabel), never a past or future date, so using
+// "now"'s ET offset is always correct -- no DST-crossing risk the way
+// there would be for an arbitrary past date.
+function _todayReportBoundaryEpoch(hour){
+  if(hour!=='bmo'&&hour!=='amc')return null;
+  const dateStr=_todayET();
+  const offsetFmt=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',timeZoneName:'shortOffset'});
+  const offsetPart=offsetFmt.formatToParts(new Date()).find(p=>p.type==='timeZoneName')?.value||'GMT-5';
+  const offsetHours=parseInt(offsetPart.replace('GMT',''))||-5;
+  const offsetStr=(offsetHours<=0?'-':'+')+String(Math.abs(offsetHours)).padStart(2,'0')+':00';
+  const hhmm=hour==='bmo'?'09:30:00':'16:00:00';
+  return new Date(dateStr+'T'+hhmm+offsetStr).getTime();
+}
+
+// Plain-fact freshness label for quoteSummary-derived earnings figures (EPS
+// estimate, prior-quarter actual, Multiple History/Next-FY multiples) --
+// only meaningful on the ticker's own earnings day itself, the one window
+// where "how recently we fetched" and "does this reflect the report" can
+// actually diverge. Outside that window there's nothing ambiguous (report
+// hasn't happened yet, or the calendar has already rolled past it to the
+// next event), so this returns null and callers show no badge at all
+// rather than a label stating the obvious on every ordinary day.
+function _earningsFreshnessLabel(earningsDate,earningsHour,summaryTsEpoch){
+  if(!earningsDate||earningsDate!==_todayET())return null;
+  const boundary=_todayReportBoundaryEpoch(earningsHour);
+  if(boundary==null)return null; // timing not confirmed -- can't say either way
+  if(!summaryTsEpoch)return'Reflects pre-earnings data';
+  return summaryTsEpoch>=boundary?'Updated post-earnings':'Reflects pre-earnings data';
 }
 
 // Companion to _todayET() -- returns the same "today" as an actual Date
@@ -420,7 +657,113 @@ function stdDev(arr){const a=avg(arr);if(a===null)return null;const v=arr.filter
 // including the watchlist/ticker RSI badge, were exposed to this. Filtering
 // once here, internally, fixes all of them at once regardless of what any
 // given caller remembers to do.
-function computeRSI(closes,period=14){const filtered=closes.filter(c=>c!=null);const result=[];for(let i=0;i<filtered.length;i++){if(i<period){result.push(null);continue;}const sl=filtered.slice(i-period,i+1);let g=0,l=0;for(let j=1;j<sl.length;j++){const d=sl[j]-sl[j-1];if(d>0)g+=d;else l-=d;}const ag=g/period,al=l/period;if(al===0){result.push(100);continue;}result.push(100-100/(1+ag/al));}return result.filter(v=>v!==null);}
+// Standard Wilder RSI(period). Each day's average gain/loss is a
+// recursive exponential smooth of the PRIOR day's average (weight
+// (period-1)/period) plus today's gain/loss (weight 1/period) -- NOT an
+// independently recomputed simple average over a fresh rolling window
+// every day, which is what this function did before. Confirmed via a
+// hand-computed worked example that the two methods can disagree by
+// several RSI points -- enough to flip which side of the 30/70 threshold
+// a ticker reads on (see tests/rsi.test.js).
+//
+// Returns an array the SAME LENGTH as `closes`, with explicit `null` at
+// any position that either (a) was itself null in the input, or (b)
+// doesn't yet have `period` full lookback days of real price data behind
+// it (including right after a null -- a genuine data gap resets the
+// smoothing rather than silently blending a stale average across it,
+// the same way a freshly-listed instrument would have to start over).
+// rsi[k] always corresponds to closes[k] -- no caller needs to know
+// `period` to map an RSI index back to a closes index, and no caller
+// should pre-filter nulls out of `closes` before calling this (doing so
+// only reintroduces the exact misalignment this design avoids: every
+// caller in this codebase that does its own null-filtering first is
+// filtering a throwaway LOCAL copy purely to avoid gap-triggered resets
+// mattering to it, never to reconstruct a closes-index mapping
+// afterward). A caller checking "is there a usable RSI at all" must
+// check the actual last non-null value, not just `.length` -- length is
+// now always closes.length, whether or not any real value exists in it.
+function computeRSI(closes,period=14){
+  const result=new Array(closes.length).fill(null);
+  let avgGain=null,avgLoss=null,seedCount=0,sumGain=0,sumLoss=0,prev=null;
+  for(let i=0;i<closes.length;i++){
+    const c=closes[i];
+    if(c==null){avgGain=avgLoss=null;seedCount=0;sumGain=0;sumLoss=0;prev=null;continue;}
+    if(prev==null){prev=c;continue;} // first real close after a gap (or the series start) -- no change to measure yet
+    const change=c-prev;prev=c;
+    const gain=change>0?change:0,loss=change<0?-change:0;
+    if(avgGain==null){
+      // Seeding the initial window -- Wilder's own convention: the first
+      // `period` changes are a plain average, and recursive smoothing
+      // only begins on the next one after that.
+      sumGain+=gain;sumLoss+=loss;seedCount++;
+      if(seedCount===period){
+        avgGain=sumGain/period;avgLoss=sumLoss/period;
+        result[i]=avgLoss===0?100:100-100/(1+avgGain/avgLoss);
+      }
+      continue;
+    }
+    avgGain=(avgGain*(period-1)+gain)/period;
+    avgLoss=(avgLoss*(period-1)+loss)/period;
+    result[i]=avgLoss===0?100:100-100/(1+avgGain/avgLoss);
+  }
+  return result;
+}
+
+// EMA seeded with a simple moving average of the first `period` values (the
+// conventional seeding method), then computed recursively forward. Unlike
+// Bollinger Bands' fixed-lookback SMA, EMA carries decaying memory of ALL
+// prior values -- so callers should always pass the full available closes
+// history, not a small display-window buffer, and let early convergence
+// imprecision decay away before the actually-displayed window starts,
+// rather than needing a fixed lookback-buffer constant the way a bounded
+// SMA/stddev computation does.
+function computeEMA(closes,period){
+  const filtered=closes.filter(c=>c!=null);
+  const result=new Array(filtered.length).fill(null);
+  if(filtered.length<period)return result;
+  const k=2/(period+1);
+  result[period-1]=avg(filtered.slice(0,period));
+  for(let i=period;i<filtered.length;i++)result[i]=filtered[i]*k+result[i-1]*(1-k);
+  return result;
+}
+
+// MACD: fast EMA minus slow EMA (the MACD line), a signal line (EMA of that
+// difference), and the histogram (their gap). Always pass the full
+// available closes history -- see computeEMA's comment on why.
+function computeMACD(closes,fast=12,slow=26,signalPeriod=9){
+  const filtered=closes.filter(c=>c!=null);
+  const emaFast=computeEMA(filtered,fast),emaSlow=computeEMA(filtered,slow);
+  const macdLine=filtered.map((_,i)=>(emaFast[i]!=null&&emaSlow[i]!=null)?emaFast[i]-emaSlow[i]:null);
+  const firstValidIdx=macdLine.findIndex(v=>v!=null);
+  const signalLine=new Array(macdLine.length).fill(null);
+  if(firstValidIdx>=0){
+    const signalOnly=computeEMA(macdLine.slice(firstValidIdx),signalPeriod);
+    for(let i=0;i<signalOnly.length;i++)signalLine[firstValidIdx+i]=signalOnly[i];
+  }
+  const histogram=macdLine.map((v,i)=>(v!=null&&signalLine[i]!=null)?v-signalLine[i]:null);
+  return{macdLine,signalLine,histogram};
+}
+
+// Plain-fact status line for the MACD chart -- deliberately states only
+// directly-observable facts (zero-line side, days since the current
+// MACD-vs-signal relationship began, histogram momentum direction), never
+// a synthesized buy/sell verdict. MACD is prone to false crossovers in
+// sideways/choppy conditions, which is exactly the kind of judgment call
+// that shouldn't be automated into a confident-sounding conclusion.
+function _macdStatusText(macdLine,signalLine,histogram){
+  let i=macdLine.length-1;
+  while(i>=0&&(macdLine[i]==null||signalLine[i]==null))i--;
+  if(i<0)return'';
+  const aboveZero=macdLine[i]>=0;
+  const bullish=macdLine[i]>signalLine[i];
+  let daysSince=0,j=i;
+  while(j>0&&macdLine[j-1]!=null&&signalLine[j-1]!=null&&((macdLine[j-1]>signalLine[j-1])===bullish)){daysSince++;j--;}
+  const crossoverText=(j===0&&macdLine[0]!=null)?`${bullish?'bullish':'bearish'} bias since chart start`:`${bullish?'bullish':'bearish'} crossover ${daysSince===0?'today':daysSince+'d ago'}`;
+  let histTrend='';
+  const h0=histogram[i],hPrior=histogram[Math.max(i-3,0)];
+  if(h0!=null&&hPrior!=null&&i>0)histTrend=Math.abs(h0)>Math.abs(hPrior)?'histogram momentum strengthening':'histogram momentum fading';
+  return`${aboveZero?'Above':'Below'} zero, ${crossoverText}${histTrend?', '+histTrend:''}`;
+}
 
 // Backtests RSI as a signal: for each historical episode where RSI crossed
 // into oversold (<30) or overbought (>70) territory, computes the stock's
@@ -454,8 +797,12 @@ function _getRSIRecentTransition(ticker,preloadedHist2y){
     if(!h2?.closes?.length||h2.closes.length<80)return null;
     const closes=h2.closes;
     const rsi=computeRSI(closes,14);
-    if(!rsi.length)return null;
-    const lastIdx=rsi.length-1;
+    // rsi.length is now always closes.length, whether or not a real value
+    // exists anywhere in it -- find the actual last non-null entry rather
+    // than assuming the final position is valid.
+    let lastIdx=rsi.length-1;
+    while(lastIdx>=0&&rsi[lastIdx]==null)lastIdx--;
+    if(lastIdx<0)return null;
     const lastRSI=rsi[lastIdx];
     const isOversold=lastRSI<RSI_OVERSOLD_THRESHOLD;
     const isOverbought=lastRSI>RSI_OVERBOUGHT_THRESHOLD;
@@ -465,6 +812,12 @@ function _getRSIRecentTransition(ticker,preloadedHist2y){
       const inZone=isOversold?(v=>v<RSI_OVERSOLD_THRESHOLD):(v=>v>RSI_OVERBOUGHT_THRESHOLD);
       let days=0;
       for(let k=lastIdx;k>=0;k--){
+        // A null here is a genuine data gap (or the pre-seeding window) --
+        // treat it the same as the old implementation effectively did by
+        // not having a position there at all: it breaks the streak rather
+        // than being silently coerced by `null<30`/`null>70` (both of
+        // which evaluate against 0, not "no data").
+        if(rsi[k]==null)break;
         if(inZone(rsi[k]))days++;
         else break;
       }
@@ -478,6 +831,7 @@ function _getRSIRecentTransition(ticker,preloadedHist2y){
     let exitZone=null,daysSinceExit=null;
     const startK=Math.max(1,lastIdx-RSI_RECENT_EXIT_DAYS+1);
     for(let k=startK;k<=lastIdx;k++){
+      if(rsi[k-1]==null||rsi[k]==null)continue; // a data gap in this window -- no transition can be read across it
       const prevOversold=rsi[k-1]<RSI_OVERSOLD_THRESHOLD;
       const prevOverbought=rsi[k-1]>RSI_OVERBOUGHT_THRESHOLD;
       const currOversold=rsi[k]<RSI_OVERSOLD_THRESHOLD;
@@ -496,7 +850,7 @@ function _computeRSIBacktestForTicker(ticker){
     if(!h2?.closes?.length||h2.closes.length<80)return null; // need enough history for RSI + forward windows to be meaningful
     const closes=h2.closes;
     const rsiPeriod=14;
-    const rsi=computeRSI(closes,rsiPeriod); // rsi[k] corresponds to closes[k+rsiPeriod]
+    const rsi=computeRSI(closes,rsiPeriod); // rsi[k] corresponds directly to closes[k] -- see computeRSI's own comment
 
     // Detect episodes: both entering a zone (first day RSI crosses in, not
     // every day spent there) and leaving it (first day RSI crosses back out).
@@ -507,16 +861,38 @@ function _computeRSIBacktestForTicker(ticker){
     // the move is over).
     const oversoldEnterIdx=[],oversoldExitIdx=[];
     const overboughtEnterIdx=[],overboughtExitIdx=[];
-    let wasOversold=false,wasOverbought=false;
+    // null = "no known prior state" -- true/false only once we've actually
+    // observed a real reading. Starts null (haven't seen anything yet) and
+    // resets to null on every gap, so a transition is only ever recorded
+    // when there's a genuine prior observation to transition FROM. Without
+    // this, the very first valid RSI reading (if already oversold/
+    // overbought) read as a fabricated "entry" with no actual preceding
+    // observation, and a gap's stale pre-gap state could keep being
+    // compared against readings on the other side of the gap -- silently
+    // connecting two logically disconnected stretches of history.
+    let wasOversold=null,wasOverbought=null;
     for(let k=0;k<rsi.length;k++){
-      const closeIdx=k+rsiPeriod;
       const v=rsi[k];
+      // rsi[k] now corresponds directly to closes[k] -- computeRSI no
+      // longer strips nulls or shortens the array, so no +rsiPeriod
+      // offset is needed (or correct) here anymore. A null position
+      // (pre-seeding window, or a genuine data gap) has no signal to
+      // read -- skip it rather than let `null<30`/`null>70` silently
+      // evaluate against 0, AND reset the known-state trackers, since
+      // whatever zone we were in before the gap isn't a trustworthy
+      // predecessor for whatever comes after it.
+      if(v==null){wasOversold=null;wasOverbought=null;continue;}
+      const closeIdx=k;
       const isOversold=v<RSI_OVERSOLD_THRESHOLD;
       const isOverbought=v>RSI_OVERBOUGHT_THRESHOLD;
-      if(isOversold&&!wasOversold)oversoldEnterIdx.push(closeIdx);
-      if(!isOversold&&wasOversold)oversoldExitIdx.push(closeIdx);
-      if(isOverbought&&!wasOverbought)overboughtEnterIdx.push(closeIdx);
-      if(!isOverbought&&wasOverbought)overboughtExitIdx.push(closeIdx);
+      if(wasOversold!=null){
+        if(isOversold&&!wasOversold)oversoldEnterIdx.push(closeIdx);
+        if(!isOversold&&wasOversold)oversoldExitIdx.push(closeIdx);
+      }
+      if(wasOverbought!=null){
+        if(isOverbought&&!wasOverbought)overboughtEnterIdx.push(closeIdx);
+        if(!isOverbought&&wasOverbought)overboughtExitIdx.push(closeIdx);
+      }
       wasOversold=isOversold;
       wasOverbought=isOverbought;
     }
@@ -585,16 +961,23 @@ function _computeRSIBacktestAggregate(tickers){
       tickersWithData++;
 
       const idxByCat={oversoldEnter:[],oversoldExit:[],overboughtEnter:[],overboughtExit:[]};
-      let wasOversold=false,wasOverbought=false;
+      // Same fix as _computeRSIBacktestForTicker above -- see its comment
+      // for the full explanation. null = no known prior state.
+      let wasOversold=null,wasOverbought=null;
       for(let k=0;k<rsi.length;k++){
-        const closeIdx=k+rsiPeriod;
         const v=rsi[k];
+        if(v==null){wasOversold=null;wasOverbought=null;continue;}
+        const closeIdx=k;
         const isOversold=v<RSI_OVERSOLD_THRESHOLD;
         const isOverbought=v>RSI_OVERBOUGHT_THRESHOLD;
-        if(isOversold&&!wasOversold)idxByCat.oversoldEnter.push(closeIdx);
-        if(!isOversold&&wasOversold)idxByCat.oversoldExit.push(closeIdx);
-        if(isOverbought&&!wasOverbought)idxByCat.overboughtEnter.push(closeIdx);
-        if(!isOverbought&&wasOverbought)idxByCat.overboughtExit.push(closeIdx);
+        if(wasOversold!=null){
+          if(isOversold&&!wasOversold)idxByCat.oversoldEnter.push(closeIdx);
+          if(!isOversold&&wasOversold)idxByCat.oversoldExit.push(closeIdx);
+        }
+        if(wasOverbought!=null){
+          if(isOverbought&&!wasOverbought)idxByCat.overboughtEnter.push(closeIdx);
+          if(!isOverbought&&wasOverbought)idxByCat.overboughtExit.push(closeIdx);
+        }
         wasOversold=isOversold;
         wasOverbought=isOverbought;
       }
@@ -710,6 +1093,30 @@ function _computeGapEvents(ticker,preloadedHist2y){
   }catch{return null;}
 }
 
+// Computes a right-censoring-free fill stat at one fixed horizon (in
+// trading days). The naive version of this stat -- filled/total across
+// EVERY gap regardless of age -- is biased two ways: a gap from
+// yesterday and a gap from 18 months ago get counted as equivalent
+// observations even though the recent one hasn't had a fair chance to
+// resolve yet (dragging the fill rate down), and averaging days-to-fill
+// over only the FILLED gaps silently excludes the longest-running open
+// ones, the exact opposite direction of bias (dragging the average up
+// -- excluded, not averaged in as slow outliers -- so the reported
+// number looks faster than reality).
+// The fix: only ever compare a gap against a horizon it's actually old
+// enough to have been fully observed for (daysSince>=horizonDays) --
+// a gap can't be judged "did it fill within 20 days" until at least 20
+// trading days have actually passed for it. Every eligible gap's
+// outcome at that horizon IS fully known by construction (filled by
+// then, or not), so there's nothing left to average or censor.
+function _gapHorizonStat(list,horizonDays){
+  const eligible=list.filter(e=>e.daysSince>=horizonDays);
+  if(!eligible.length)return{eligible:0,filledCount:0,openCount:0,filledPct:null,openPct:null};
+  const filledCount=eligible.filter(e=>e.filled&&e.daysToFill<=horizonDays).length;
+  const openCount=eligible.length-filledCount;
+  return{eligible:eligible.length,filledCount,openCount,filledPct:filledCount/eligible.length*100,openPct:openCount/eligible.length*100};
+}
+
 // Per-ticker fill-rate/avg-days summary. Small per-ticker sample size over
 // 2 years of history, same caveat as the RSI Backtest -- the aggregate
 // view across the watchlist is the more statistically meaningful lens.
@@ -718,12 +1125,15 @@ function _computeGapSummaryForTicker(ticker,preloadedHist2y){
   if(!events)return null;
   const summarizeDir=(dir)=>{
     const list=events.filter(e=>e.direction===dir);
-    const filled=list.filter(e=>e.filled);
     return{
       count:list.length,
-      filledCount:filled.length,
-      fillRate:list.length?filled.length/list.length*100:null,
-      avgDaysToFill:filled.length?filled.reduce((a,e)=>a+e.daysToFill,0)/filled.length:null
+      filledCount:list.filter(e=>e.filled).length, // unbounded raw count -- not a rate/average, so not subject to the censoring bias above
+      horizons:{
+        sameDay:_gapHorizonStat(list,0),
+        within5:_gapHorizonStat(list,5),
+        within20:_gapHorizonStat(list,20),
+        within60:_gapHorizonStat(list,60), // .openPct here IS "still open after 60 days", over the same eligible set
+      },
     };
   };
   return{ticker,totalGaps:events.length,up:summarizeDir('up'),down:summarizeDir('down'),events};
@@ -741,15 +1151,16 @@ function _computeGapAggregate(tickers){
     tickersWithData++;
     events.forEach(e=>{(e.direction==='up'?allUp:allDown).push(e);});
   });
-  const summarize=(list)=>{
-    const filled=list.filter(e=>e.filled);
-    return{
-      count:list.length,
-      filledCount:filled.length,
-      fillRate:list.length?filled.length/list.length*100:null,
-      avgDaysToFill:filled.length?filled.reduce((a,e)=>a+e.daysToFill,0)/filled.length:null
-    };
-  };
+  const summarize=(list)=>({
+    count:list.length,
+    filledCount:list.filter(e=>e.filled).length,
+    horizons:{
+      sameDay:_gapHorizonStat(list,0),
+      within5:_gapHorizonStat(list,5),
+      within20:_gapHorizonStat(list,20),
+      within60:_gapHorizonStat(list,60),
+    },
+  });
   return{up:summarize(allUp),down:summarize(allDown),tickersWithData,tickersTotal:tickers.length};
 }
 
@@ -847,11 +1258,9 @@ function computeIVR(ticker,w52h,w52l,price){
     if(!w52h||!w52l||w52h<=w52l)return null;
     const rangeVol=Math.min((w52h-w52l)/w52l,0.8);
     // Get current ATM IV from options chain for fallback
-    const cached=S.get('options_'+ticker);
-    const res=cached?.data?.optionChain?.result?.[0];
-    if(!res)return null;
-    const opts=res.options?.[0];if(!opts)return null;
-    const atm=[...(opts.puts||[]),...(opts.calls||[])]
+    const nearEntry=_nearestExpEntry(ticker);
+    if(!nearEntry)return null;
+    const atm=[..._expPuts(nearEntry),..._expCalls(nearEntry)]
       .filter(o=>Math.abs(o.strike-price)/price<0.05&&o.impliedVolatility>0);
     if(!atm.length)return null;
     const currentIV=avg(atm.map(o=>o.impliedVolatility));
@@ -1027,7 +1436,7 @@ function newsSentiment(h){const l=h.toLowerCase();if(POS_WORDS.some(w=>l.include
 
 function sentDot(s){return s.dot==='pos'?'&#x1F7E2;':s.dot==='neg'?'&#x1F534;':'&#x26AA;';}
 
-function renderNewsItems(newsArr,maxItems=5){if(!newsArr||!newsArr.length)return'<div style="font-family:var(--mono);font-size:11px;color:var(--text3);padding:8px 0">No recent news available</div>';const items=newsArr.slice(0,maxItems);const pos=items.filter(n=>newsSentiment(n.headline).dot==='pos').length;const neg=items.filter(n=>newsSentiment(n.headline).dot==='neg').length;return`<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">${items.length} articles -- ${pos} positive, ${neg} negative</div>`+items.map(n=>{const s=newsSentiment(n.headline);return`<div class="news-item"><div class="news-headline"><span style="${s.css}">${sentDot(s)}</span> <a href="${n.url}" target="_blank" rel="noopener">${n.headline}</a></div><div class="news-meta">${n.source} -- ${relTime(n.datetime)}</div>${n.summary?`<div class="news-summary">${n.summary.slice(0,120)}...</div>`:''}</div>`;}).join('');}
+function renderNewsItems(newsArr,maxItems=5){if(!newsArr||!newsArr.length)return'<div style="font-family:var(--mono);font-size:11px;color:var(--text3);padding:8px 0">No recent news available</div>';const items=newsArr.slice(0,maxItems);const pos=items.filter(n=>newsSentiment(n.headline).dot==='pos').length;const neg=items.filter(n=>newsSentiment(n.headline).dot==='neg').length;return`<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">${items.length} articles -- ${pos} positive, ${neg} negative</div>`+items.map(n=>{const s=newsSentiment(n.headline);const _href=_safeHref(n.url);const _headline=_escHtml(n.headline);return`<div class="news-item"><div class="news-headline"><span style="${s.css}">${sentDot(s)}</span> ${_href?`<a href="${_href}" target="_blank" rel="noopener">${_headline}</a>`:_headline}</div><div class="news-meta">${_escHtml(n.source)} -- ${relTime(n.datetime)}</div>${n.summary?`<div class="news-summary">${_escHtml(n.summary.slice(0,120))}...</div>`:''}</div>`;}).join('');}
 
 // ── Debug log (rolling 20 entries, displayed in Settings) ─────────────────────
 window._dbgLog = [];
@@ -1062,22 +1471,25 @@ function _normCDF(x){
   return x>=0?cdf:1-cdf;
 }
 
-function _bsD1D2(S,K,T,r,sigma){
-  const d1=(Math.log(S/K)+(r+sigma*sigma/2)*T)/(sigma*Math.sqrt(T));
+function _bsD1D2(S,K,T,r,sigma,q){
+  q=q||0;
+  const d1=(Math.log(S/K)+(r-q+sigma*sigma/2)*T)/(sigma*Math.sqrt(T));
   const d2=d1-sigma*Math.sqrt(T);
   return{d1,d2};
 }
 
-function _bsCallPrice(S,K,T,r,sigma){
+function _bsCallPrice(S,K,T,r,sigma,q){
   if(T<=0||sigma<=0)return Math.max(S-K,0);
-  const{d1,d2}=_bsD1D2(S,K,T,r,sigma);
-  return S*_normCDF(d1)-K*Math.exp(-r*T)*_normCDF(d2);
+  q=q||0;
+  const{d1,d2}=_bsD1D2(S,K,T,r,sigma,q);
+  return S*Math.exp(-q*T)*_normCDF(d1)-K*Math.exp(-r*T)*_normCDF(d2);
 }
 
-function _bsPutPrice(S,K,T,r,sigma){
+function _bsPutPrice(S,K,T,r,sigma,q){
   if(T<=0||sigma<=0)return Math.max(K-S,0);
-  const{d1,d2}=_bsD1D2(S,K,T,r,sigma);
-  return K*Math.exp(-r*T)*_normCDF(-d2)-S*_normCDF(-d1);
+  q=q||0;
+  const{d1,d2}=_bsD1D2(S,K,T,r,sigma,q);
+  return K*Math.exp(-r*T)*_normCDF(-d2)-S*Math.exp(-q*T)*_normCDF(-d1);
 }
 
 // Solves for the strike matching a target delta magnitude (e.g. 0.30 for a
@@ -1103,17 +1515,24 @@ function _annualizedYieldPct(premium,S,T){
   return(premium/S)*(365/(T*365))*100;
 }
 
-function _solveStrikeForYieldFloor(S,T,r,sigma,targetFloorPct,optionType){
+function _solveStrikeForYieldFloor(S,T,r,sigma,targetFloorPct,optionType,q){
   const bsPriceFn=optionType==='put'?_bsPutPrice:_bsCallPrice;
-  const atmPremium=bsPriceFn(S,S,T,r,sigma);
-  const atmYield=_annualizedYieldPct(atmPremium,S,T);
+  const atmPremium=bsPriceFn(S,S,T,r,sigma,q);
+  const atmYield=_annualizedYieldPct(atmPremium,S,T); // strike==spot at the money, so this line is convention-agnostic either way
   if(atmYield<targetFloorPct)return null; // not reachable at this DTE, even at the money
 
   let lo,hi;
   if(optionType==='put'){lo=S*0.3;hi=S;}else{lo=S;hi=S*2.0;}
   for(let i=0;i<60;i++){
     const mid=(lo+hi)/2;
-    const yieldPct=_annualizedYieldPct(bsPriceFn(S,mid,T,r,sigma),S,T);
+    // Puts: yield on actual committed capital is premium/strike (the cash
+    // reserved to secure the put), matching how a real CSP position's
+    // notional is valued elsewhere in this app -- not premium/spot, which
+    // is unrelated to what's actually tied up for this specific trade.
+    // Calls keep spot as the denominator (premium relative to the value of
+    // shares already held), which is the standard covered-call convention.
+    const yieldDenom=optionType==='put'?mid:S;
+    const yieldPct=_annualizedYieldPct(bsPriceFn(S,mid,T,r,sigma,q),yieldDenom,T);
     if(optionType==='put'){
       if(yieldPct>=targetFloorPct)hi=mid;else lo=mid; // converge toward the smallest feasible (most OTM) K
     }else{

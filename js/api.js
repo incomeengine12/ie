@@ -36,40 +36,52 @@ async function yahooHistory(symbol,range='6mo',interval='1d'){
   const r=await fetch(url);if(!r.ok)throw new Error(`History proxy ${r.status}`);
   const d=await r.json();if(d.error)throw new Error(d.error);
   const result=d.chart?.result?.[0];if(!result)throw new Error('No history data');
+  const rawTimestamps=result.timestamp;
+  const q=result.indicators?.quote?.[0];
+  // A malformed/truncated response (missing the arrays this function's
+  // whole return shape depends on) used to fail as an unrelated-looking
+  // TypeError several lines down (q.close on an undefined q) rather than
+  // a clear, catchable error here.
+  if(!Array.isArray(rawTimestamps)||!rawTimestamps.length||!q||!Array.isArray(q.close)){
+    throw new Error('Malformed history response -- missing timestamp or price data');
+  }
   const adjcloses=result.indicators.adjclose?.[0]?.adjclose||null;
-  const q=result.indicators.quote[0];
-  return{timestamps:result.timestamp.map(t=>new Date(t*1000)),closes:q.close,volumes:q.volume||[],adjcloses,opens:q.open||null,highs:q.high||null,lows:q.low||null};
+  // Yahoo's arrays are SUPPOSED to be positionally aligned and equal
+  // length, but a malformed/truncated response can have them drift --
+  // normalize to the shortest array actually present rather than let a
+  // length mismatch silently misalign price to date downstream (RSI, gap
+  // detection, and other index-based logic throughout this app all
+  // assume timestamps[i] and closes[i] describe the same day). A no-op
+  // for any well-formed response, where the lengths already match.
+  const n=Math.min(rawTimestamps.length,q.close.length);
+  const timestamps=rawTimestamps.slice(0,n).map(t=>new Date(t*1000));
+  const closes=q.close.slice(0,n);
+  const volumes=(q.volume||[]).slice(0,n);
+  const opens=q.open?q.open.slice(0,n):null;
+  const highs=q.high?q.high.slice(0,n):null;
+  const lows=q.low?q.low.slice(0,n):null;
+  return{timestamps,closes,volumes,adjcloses:adjcloses?adjcloses.slice(0,n):null,opens,highs,lows};
 }
 
 function slimOptionsData(json){
-  // Strip Yahoo options response to only fields needed by buildOptionsTable and renderOIChart
-  // Raw response can be 500KB+; slimmed version is ~50KB, well within localStorage limits
+  // Strip Yahoo options response down to ticker-level metadata only --
+  // expiration dates, strikes, and the underlying quote. Does NOT embed
+  // per-expiration contract data (puts/calls) here; that lives exclusively
+  // in the options_exp_<ticker>_<date> caches (see slimExpData in
+  // options.js), which is where every reader now looks it up via
+  // _nearestExpEntry() in helpers.js. Previously this embedded a full copy
+  // of the nearest expiration's contracts too, in a more verbose field
+  // shape than options_exp_ uses for the exact same data -- a real,
+  // confirmed duplication across every ticker, now eliminated at the
+  // source rather than cleaned up after the fact.
   const result=json?.optionChain?.result?.[0];
   if(!result)return json;
-  const slimContract=c=>({
-    strike:c.strike,
-    bid:c.bid,
-    ask:c.ask,
-    lastPrice:c.lastPrice,
-    openInterest:c.openInterest,
-    volume:c.volume,
-    impliedVolatility:c.impliedVolatility,
-    inTheMoney:c.inTheMoney,
-    expiration:c.expiration
-  });
-  const slimOptions=(result.options||[]).map(o=>({
-    expirationDate:o.expirationDate,
-    hasMiniOptions:o.hasMiniOptions,
-    puts:(o.puts||[]).map(slimContract),
-    calls:(o.calls||[]).map(slimContract)
-  }));
   return{optionChain:{result:[{
     underlyingSymbol:result.underlyingSymbol,
     expirationDates:result.expirationDates,
     strikes:result.strikes,
     hasMiniOptions:result.hasMiniOptions,
-    quote:{regularMarketPrice:result.quote?.regularMarketPrice},
-    options:slimOptions
+    quote:{regularMarketPrice:result.quote?.regularMarketPrice}
   }],error:null}};
 }
 
@@ -82,8 +94,12 @@ async function yahooOptionsViaProxy(symbol,expiration){
     const errText=await r.text().catch(()=>'');
     throw new Error(`Options proxy ${r.status}: ${errText.slice(0,80)}`);
   }
-  const json=await r.json();
-  return slimOptionsData(json);
+  // Return the RAW response. Callers validate first (_validateOptionsData needs
+  // result.options) and only then slim at write time: slimOptionsData() for the
+  // ticker-level options_<t> cache, slimExpData() for options_exp_<t>_<date>.
+  // (Build 472 wrongly slimmed here, which stripped result.options before
+  // validation and broke every options cache refresh -- fixed in 474.)
+  return await r.json();
 }
 
 async function fetchQuoteSummary(symbol){
@@ -356,6 +372,46 @@ async function fetchFedFundsFutures(){
     // far-dated CME contract, etc.) previously vanished from both this
     // list and the meeting-probability breakdown with zero trace anywhere.
     return{contracts,failedMonths};
+  }catch{return null;}
+}
+
+async function fetchEffrHistory(startDate){
+  // New York Fed Markets Data API -- Effective Federal Funds Rate (EFFR)
+  // plus the official upper/lower target range, for each business day in
+  // the window. Used to authoritatively classify PAST FOMC meetings (see
+  // _resolveMeetingFromEffr in market.js) instead of inferring the outcome
+  // from futures reprice. Public, no API key needed; routed through the
+  // Worker purely for a consistent fetch/caching/error-handling pattern --
+  // the Worker's effr branch skips the Yahoo cookie/crumb dance entirely,
+  // it isn't needed here.
+  // startDate is a Date, normally computed by the caller (market.js's
+  // _earliestEffrStartNeeded) from the actual earliest month present in
+  // this fetch's fedFutures window -- a fixed lookback isn't reliably
+  // wide enough: near the end of a month, a meeting early in the PRIOR
+  // month can already be more than 45 days old while its contract is
+  // still sitting in the one-month-back futures window. Falls back to a
+  // flat 45-day lookback only if the caller doesn't supply one (kept as a
+  // safety default, not the normal path).
+  if(offlineMode)return null;
+  try{
+    const end=new Date();
+    const start=(startDate instanceof Date)?startDate:addDays(end,-45);
+    const r=await fetch(`${WORKER_URL}/?type=effr&startDate=${fmtDate(start)}&endDate=${fmtDate(end)}&_t=${Date.now()}`);
+    const d=await r.json();
+    const rows=d?.refRates;
+    if(!Array.isArray(rows))return null;
+    // Normalize + sort ascending by date -- the API's own ordering isn't
+    // documented/guaranteed, and _resolveMeetingFromEffr's nearest-
+    // before/after lookup in market.js depends on ascending order.
+    return rows
+      .map(x=>({
+        effectiveDate:x.effectiveDate,
+        percentRate:x.percentRate,
+        targetRateFrom:x.targetRateFrom,
+        targetRateTo:x.targetRateTo,
+      }))
+      .filter(x=>x.effectiveDate&&x.percentRate!=null&&x.targetRateFrom!=null&&x.targetRateTo!=null)
+      .sort((a,b)=>a.effectiveDate<b.effectiveDate?-1:(a.effectiveDate>b.effectiveDate?1:0));
   }catch{return null;}
 }
 

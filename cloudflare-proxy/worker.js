@@ -1,12 +1,21 @@
 // ============================================
 // Income Engine -- Cloudflare Worker Proxy v2
-// Handles five request types:
+// Handles six request types:
 //   ?ticker=NVDA&type=options   -> Yahoo options chain
 //   ?ticker=NVDA&type=history   -> Yahoo price history
 //   ?ticker=SPYI&type=dividends -> Yahoo dividend events
-//   ?series=DTB3&type=fred      -> FRED T-bill yield data
 //   ?type=finnhub&path=...      -> Finnhub proxy (server-side key, see below)
+//   ?type=effr&startDate=...&endDate=...
+//                                -> New York Fed EFFR/target-range data,
+//                                   used to authoritatively resolve past
+//                                   FOMC meetings (see js/market.js). Public,
+//                                   no key, no Yahoo cookie/crumb dance.
 // All Yahoo request types handle cookie+crumb auth server-side.
+// (The "?series=X&type=fred" route referenced in older comments here was
+// never actually implemented -- Treasury yields are fetched via Yahoo's
+// ^IRX/^FVX/^TNX indices instead, see js/api.js fetchTBills. The unused
+// `series` param below is dead and can be removed whenever this file is
+// next touched for an unrelated reason.)
 // Free tier: 100,000 requests/day
 //
 // Secrets (set via Cloudflare dashboard -> Settings -> Variables and Secrets,
@@ -63,6 +72,11 @@ export default {
       return handleFinnhubProxy(url, env);
     }
 
+    // ── NY Fed EFFR proxy: also no Yahoo cookie/crumb needed ──
+    if (type === 'effr') {
+      return handleEffrProxy(url);
+    }
+
     const ticker = url.searchParams.get('ticker');
     const series = url.searchParams.get('series');
     const expiration = url.searchParams.get('expiration');
@@ -76,6 +90,15 @@ export default {
 
     // ── All Yahoo requests need cookie+crumb ──
     if (!ticker) return corsJson({ error: 'ticker parameter required' }, 400);
+    // The upstream host is fixed (always Yahoo), so this isn't general
+    // SSRF, but ticker/range/interval/modules flow directly into the
+    // request URL below with no validation before this -- allowlisting
+    // the shapes this app actually sends reduces how far someone with
+    // just the shared Worker URL (no app, no key of their own) could
+    // push a shared Finnhub/Yahoo-session key toward unexpected requests.
+    const modulesParam = url.searchParams.get('modules') || 'financialData';
+    const paramError = _validateYahooRequestParams(type, ticker, range, interval, modulesParam);
+    if (paramError) return corsJson({ error: paramError }, 400);
 
     try {
       // Step 1: Get Yahoo session cookie
@@ -204,6 +227,86 @@ function corsJson(obj, status = 200) {
   });
 }
 
+// Validates the Yahoo-request parameters against the shapes/values this
+// app's own client code actually sends (js/api.js), before any of them
+// reach the upstream request URL. Returns an error string, or null when
+// everything checks out. type is only relevant for the 'modules' check
+// (only the summary/quoteSummary endpoint uses it); ticker/range/interval
+// apply to every Yahoo request type.
+function _validateYahooRequestParams(type, ticker, range, interval, modulesParam) {
+  if (!/^[A-Za-z0-9^.-]{1,15}$/.test(ticker)) return 'invalid ticker format';
+  const VALID_RANGES = new Set(['1d','5d','1mo','3mo','6mo','1y','2y','3y','5y','10y','ytd','max']);
+  if (!VALID_RANGES.has(range)) return 'invalid range';
+  const VALID_INTERVALS = new Set(['1m','2m','5m','15m','30m','60m','90m','1h','1d','5d','1wk','1mo','3mo']);
+  if (!VALID_INTERVALS.has(interval)) return 'invalid interval';
+  if (type === 'summary') {
+    const VALID_MODULES = new Set(['financialData','defaultKeyStatistics','earningsTrend','recommendationTrend','earningsHistory','assetProfile','topHoldings','quoteType','summaryDetail']);
+    if (!String(modulesParam).split(',').every(m => VALID_MODULES.has(m))) return 'invalid modules';
+  }
+  return null;
+}
+
+// Proxies the New York Fed Markets Data API's EFFR (Effective Federal Funds
+// Rate) endpoint -- a plain, public, CORS-enabled JSON API that needs no key
+// and none of the Yahoo cookie/crumb machinery above. Deliberately narrow:
+// this is NOT a general-purpose proxy to markets.newyorkfed.org -- only the
+// one search/effr route is reachable, and only with validated YYYY-MM-DD
+// dates, so this can't be turned into an open relay to an arbitrary NY Fed
+// (or any other) URL by a crafted query string.
+// Validates that a YYYY-MM-DD string is a REAL calendar date, not just
+// shaped like one. Deliberately not `!isNaN(Date.parse(str))` -- V8's
+// Date.parse is lenient about day overflow (2026-02-30 silently parses as
+// 2026-03-02 rather than being rejected), which would let an impossible
+// date slip through undetected and get forwarded to the NY Fed API as
+// something else entirely.
+function _isValidISODate(str) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+  if (!m) return false;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  if (mo < 1 || mo > 12) return false;
+  const daysInMonth = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  return d >= 1 && d <= daysInMonth;
+}
+
+async function handleEffrProxy(url) {
+  const startDate = url.searchParams.get('startDate');
+  const endDate = url.searchParams.get('endDate');
+  if (!startDate || !endDate || !_isValidISODate(startDate) || !_isValidISODate(endDate)) {
+    return corsJson({ error: 'startDate and endDate must be real calendar dates in YYYY-MM-DD format' }, 400);
+  }
+  const startMs = Date.parse(startDate + 'T00:00:00Z');
+  const endMs = Date.parse(endDate + 'T00:00:00Z');
+  if (startMs > endMs) {
+    return corsJson({ error: 'startDate must not be after endDate' }, 400);
+  }
+  const MAX_RANGE_DAYS = 120; // the client only ever needs a few months at most
+  if ((endMs - startMs) / 86400000 > MAX_RANGE_DAYS) {
+    return corsJson({ error: `date range too large (max ${MAX_RANGE_DAYS} days)` }, 400);
+  }
+  try {
+    const targetUrl = `https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json?startDate=${startDate}&endDate=${endDate}`;
+    const dataResponse = await fetch(targetUrl, {
+      headers: { 'Accept': 'application/json' }
+    });
+    if (!dataResponse.ok) {
+      return corsJson({ error: `NY Fed API returned ${dataResponse.status}` }, dataResponse.status);
+    }
+    const data = await dataResponse.json();
+    return new Response(JSON.stringify(data), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        // EFFR publishes once per business day (~8am ET, for the prior
+        // business day) -- nothing is gained refetching more than hourly.
+        'Cache-Control': 'public, max-age=3600'
+      }
+    });
+  } catch (err) {
+    return corsJson({ error: 'EFFR proxy fetch failed', message: err.message }, 500);
+  }
+}
+
 // Proxies Finnhub API calls using a server-side key (env.FINNHUB_KEY), so
 // clients never need their own Finnhub account/key. Expects the client to
 // pass the same path shape used by the app's direct-call fh() function in
@@ -221,6 +324,16 @@ async function handleFinnhubProxy(url, env) {
 
   const path = url.searchParams.get('path');
   if (!path) return corsJson({ error: 'path parameter required' }, 400);
+  // Only the endpoint families api.js actually calls (see js/api.js: fh()
+  // callers in market.js, prefetch.js, ticker.js). The upstream host is
+  // fixed either way, so this isn't SSRF, but without this, anyone who
+  // has just the shared Worker URL -- no app, no Finnhub key of their
+  // own -- could route arbitrary Finnhub API calls through the owner's
+  // shared key.
+  const ALLOWED_FINNHUB_PATH_PREFIXES = ['/calendar/earnings?', '/stock/upgrade-downgrade?', '/news?', '/company-news?'];
+  if (!ALLOWED_FINNHUB_PATH_PREFIXES.some(p => path.startsWith(p))) {
+    return corsJson({ error: 'path not allowed' }, 400);
+  }
 
   try {
     const targetUrl = `https://finnhub.io/api/v1${path}&token=${key}`;

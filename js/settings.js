@@ -84,15 +84,10 @@ async function checkFlightModeReady(){
   const checks=[];
 
   // Helper: age in hours
-  const ageHrs=ts=>{
-    if(!ts)return null;
-    try{
-      // Handle both string timestamps and {ts:string} objects
-      const tsStr=typeof ts==='object'&&ts.ts?ts.ts:(typeof ts==='string'?ts:null);
-      if(!tsStr)return null;
-      const d=new Date(tsStr.replace(/ PT$| UTC$| local$/,'').trim());
-      return isNaN(d.getTime())?null:(now-d.getTime())/3600000;
-    }catch{return null;}
+  const ageHrs=rec=>{
+    // Accepts a whole cache record ({ts,tsEpoch}) or a legacy bare ts string.
+    const e=_recEpoch(rec);
+    return e==null?null:(now-e)/3600000;
   };
   const ageStr=hrs=>{
     if(hrs===null)return'missing';
@@ -108,7 +103,7 @@ async function checkFlightModeReady(){
   wl.forEach(t=>{
     const sn=S.get('snap_'+t);
     if(!sn){snapMissing++;return;}
-    const hrs=ageHrs(sn.ts);
+    const hrs=ageHrs(sn);
     if(!ok(hrs))snapStale++;
   });
   const snapStatus=snapMissing>0?'red':snapStale>0?'amber':'green';
@@ -135,7 +130,8 @@ async function checkFlightModeReady(){
   wl.forEach(t=>{
     const o=S.get('options_'+t);
     if(!o){optsMissing++;return;}
-    const puts=o.data?.optionChain?.result?.[0]?.options?.[0]?.puts||[];
+    const nearEntry=_nearestExpEntry(t);
+    const puts=nearEntry?_expPuts(nearEntry):[];
     const totalOI=puts.reduce((s,p)=>s+(p.openInterest||0),0);
     if(totalOI===0)optsZeroOI++;
   });
@@ -145,7 +141,7 @@ async function checkFlightModeReady(){
 
   // 4. VIX history
   const vixH=S.get('vix_hist');
-  const vixAge=vixH?.ts?ageHrs(vixH.ts):null;
+  const vixAge=vixH?.ts?ageHrs(vixH):null;
   checks.push({label:'VIX data',status:ok(vixAge)?'green':'red',
     detail:vixAge!==null?ageStr(vixAge):'not cached'});
 
@@ -158,7 +154,7 @@ async function checkFlightModeReady(){
 
   // 6. Market data
   const mktTsRaw=S.get('mkt_ts');
-  const mktAge=ageHrs(mktTsRaw?.ts||mktTsRaw);
+  const mktAge=ageHrs(mktTsRaw);
   checks.push({label:'Market data',status:ok(mktAge)?'green':'red',
     detail:mktAge!==null?ageStr(mktAge):'not cached'});
 
@@ -410,25 +406,56 @@ function saveFomcDates(){
   const ta=document.getElementById('fomc-dates-textarea');
   if(!ta)return;
   const lines=ta.value.split('\n').map(l=>l.trim()).filter(l=>l.length);
-  const valid=[],invalid=[];
+  const valid=[],invalid=[],duplicateMonths=[];
+  const CURRENT_YEAR=new Date().getFullYear();
+  const seenMonths=new Set();
   lines.forEach(l=>{
     // Strictly YYYY-MM-DD -- matches the format used throughout the rest
-    // of the app, and avoids ambiguous MM/DD vs DD/MM parsing.
-    if(/^\d{4}-\d{2}-\d{2}$/.test(l)&&!isNaN(new Date(l+'T12:00:00Z').getTime()))valid.push(l);
-    else invalid.push(l);
+    // of the app, and avoids ambiguous MM/DD vs DD/MM parsing. Uses the
+    // same real-calendar-date check as the Worker's EFFR route (not
+    // `!isNaN(new Date(...))`, which silently rolls e.g. 2026-02-30
+    // forward into March rather than rejecting it).
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(l)||!_isValidISODate(l)){invalid.push(l);return;}
+    const year=parseInt(l.slice(0,4),10);
+    // A generous window either side of "now" -- wide enough to never
+    // reject a real, deliberately-entered date, narrow enough to catch
+    // an obvious typo (a transposed digit landing decades off).
+    if(year<CURRENT_YEAR-5||year>CURRENT_YEAR+10){invalid.push(l);return;}
+    const monthKey=l.slice(0,7); // YYYY-MM
+    if(seenMonths.has(monthKey)){duplicateMonths.push(l);return;}
+    seenMonths.add(monthKey);
+    valid.push(l);
   });
   if(invalid.length){
-    toast('Not saved -- '+invalid.length+' line(s) not in YYYY-MM-DD format: '+invalid.slice(0,3).join(', ')+(invalid.length>3?'...':''),5000);
+    toast('Not saved -- '+invalid.length+' line(s) invalid (not a real YYYY-MM-DD calendar date, or outside a reasonable year range): '+invalid.slice(0,3).join(', ')+(invalid.length>3?'...':''),5000);
+    return;
+  }
+  if(duplicateMonths.length){
+    // The FOMC has never actually held two scheduled meetings in the same
+    // calendar month -- this almost always means a typo'd duplicate
+    // rather than a genuine second meeting, so it's treated as a hard
+    // stop rather than a silent accept.
+    toast('Not saved -- more than one meeting in the same month: '+duplicateMonths.slice(0,3).join(', ')+(duplicateMonths.length>3?'...':'')+'. The FOMC has never held two scheduled meetings in one calendar month -- if this is a typo, fix the duplicate date and save again.',6000);
     return;
   }
   if(!valid.length){
     toast('Not saved -- list is empty. Use Reset to Defaults to start over.',4000);
     return;
   }
+  // The FOMC normally holds 8 meetings/year -- not enforced as a hard
+  // rule (a genuine reason to track more or fewer is possible), just
+  // surfaced so an obviously-wrong count doesn't save silently unnoticed.
+  // Folded into the SAME toast as the save confirmation below, not a
+  // separate one fired first -- two toasts back to back meant this
+  // warning was replaced by the unconditional "saved" toast before
+  // there was any real chance to read it.
+  const unusualCountNote=(valid.length<6||valid.length>10)
+    ?' -- unusual count (FOMC normally holds 8/year); double-check if unintentional'
+    :'';
   const deduped=[...new Set(valid)].sort();
   S.set('fomc_meeting_dates_override',deduped);
   ta.value=deduped.join('\n');
-  toast('FOMC meeting dates saved ('+deduped.length+' dates)',3000);
+  toast('FOMC meeting dates saved ('+deduped.length+' dates)'+unusualCountNote,unusualCountNote?6000:3000);
 }
 function resetFomcDatesToDefault(){
   S.del('fomc_meeting_dates_override');
@@ -447,6 +474,7 @@ function openSettings(){
   document.getElementById('offline-mode-input').checked=offlineMode;
   document.getElementById('debug-options-fetch-input').checked=S.get('debug_options_fetch')==='true';
   document.getElementById('fetch-upgrades-input').checked=S.get('fetch_upgrades_enabled')==='true';
+  document.getElementById('wheelbt-term-structure-input').checked=S.get('wheelbt_term_structure_enabled')!=='false';
   document.getElementById('font-size-input').value=fontSize;
   loadWeightSliders();
   _populateCutoffSelect();
@@ -465,9 +493,9 @@ function saveSettings(){
   if(key){FINNHUB_KEY=key;S.set('finnhub_key',key);}
   const wf=_normalizeWorkerFragment(document.getElementById('worker-fragment-settings-input').value);
   if(wf){S.set('worker_fragment',wf);WORKER_URL=_buildWorkerUrl(wf);}
-  const wl=document.getElementById('default-watchlist-input').value.split(',').map(t=>t.trim().toUpperCase()).filter(t=>t.length>0);
+  const wl=document.getElementById('default-watchlist-input').value.split(',').map(t=>normalizeTicker(t)).filter(Boolean);
   if(wl.length>0){watchlist=wl;S.set('watchlist',wl);}
-  vixThreshold=parseInt(document.getElementById('vix-threshold-input').value)||20;
+  vixThreshold=Math.round(finiteNumber(document.getElementById('vix-threshold-input').value,{min:1,max:200,fallback:20}));
   S.set('vix_threshold',String(vixThreshold));
   const _prefetchSleepMs=Math.min(5000,Math.max(100,parseInt(document.getElementById('prefetch-sleep-input').value)||100));
   S.set('prefetch_sleep_ms',String(_prefetchSleepMs));
@@ -479,6 +507,7 @@ function saveSettings(){
   S.set('offline_mode',String(offlineMode));
   S.set('debug_options_fetch',String(document.getElementById('debug-options-fetch-input').checked));
   S.set('fetch_upgrades_enabled',String(document.getElementById('fetch-upgrades-input').checked));
+  S.set('wheelbt_term_structure_enabled',String(document.getElementById('wheelbt-term-structure-input').checked));
   updateOfflineModeBar();
   fontSize=document.getElementById('font-size-input').value||'19';
   S.set('font_size',fontSize);
@@ -519,7 +548,8 @@ function closeOfflineModal(){document.getElementById('offline-confirm-modal').cl
 function clearAllDataConfirmed(){
   closeOfflineModal();
   localStorage.clear();FINNHUB_KEY='';WORKER_URL='';watchlist=[...DEFAULT_WATCHLIST];currentTicker='';offlineMode=false;
-  toast('All data cleared');renderWatchlist();updateVIXIndicator(null);updateOfflineModeBar();
+  toast('All saved app data cleared'); // localStorage only -- deliberately does not touch Cache Storage (the offline app shell), which stays intact so the PWA still works offline after this
+  renderWatchlist();updateVIXIndicator(null);updateOfflineModeBar();
   try{openWorkerSetupOverlay();}catch(e){console.error('Worker setup overlay error:',e);}
 }
 
@@ -531,7 +561,7 @@ function clearMarketDataCache(){
     'options_cutoff_et','rp_earnings_toggle','earnings_view_mode','dashboard_view_mode',
     'vol_badge_state','conviction_weights','last_ticker',
     'income_accounts_meta','income_active_account','income_migration_v1',
-    'debug_options_fetch','prefetch_sleep_ms','fetch_upgrades_enabled',
+    'debug_options_fetch','prefetch_sleep_ms','fetch_upgrades_enabled','wheelbt_term_structure_enabled',
   ]);
   const toDelete=[];
   for(let i=0;i<localStorage.length;i++){
@@ -564,7 +594,16 @@ function clearMarketDataCache(){
        k.startsWith('rec_')||k.startsWith('upgrades_')||
        k.startsWith('mkt_')||k.startsWith('tbills_')||k.startsWith('vix')||
        k.startsWith('div_')||k==='market_news'||
-       k==='hist2y_sp500'){
+       k==='hist2y_sp500'||
+       // fomc_meeting_history: as of 495, every entry is a resolved meeting
+       // re-derivable from the NY Fed's official history (or a futures-
+       // implied fallback that self-corrects the next time NY Fed data
+       // covers it) -- routine, re-fetchable, safe to sweep. Not matched by
+       // a shared prefix with fomc_meeting_dates_override (genuine user
+       // config, deliberately NOT swept here) or fed_futures (deliberately
+       // NOT swept here either, per the comment above), so both are named
+       // explicitly rather than widening a prefix.
+       k==='fomc_meeting_history'||k==='fomc_effr_cache'){
       toDelete.push(k);
     }
   }
@@ -581,24 +620,22 @@ const EXPORT_KEYS_STATIC=[
   'vol_badge_state','last_ticker',
   'etf_research_tickers',
   'income_accounts_meta','income_active_account','income_migration_v1',
-  'debug_options_fetch','prefetch_sleep_ms','fetch_upgrades_enabled',
+  'debug_options_fetch','prefetch_sleep_ms','fetch_upgrades_enabled','wheelbt_term_structure_enabled',
   'dashboard_notes','bb_gap_overlay','gap_list_filter',
   'tax_state','state_tax_rate',
   'fomc_meeting_dates_override',
-  // Self-healing baseline for the meeting-probability calculation -- now a
-  // full history of every meeting ever successfully resolved, indexed by
-  // meeting date (replaces the old single-latest-value version, which had
-  // a real blind spot: it could only help a stuck meeting whose immediate
-  // predecessor happened to be the single most recent resolution overall,
-  // not any earlier one). Not re-derivable from a fresh fetch if lost --
-  // losing it just means falling back to the honest "insufficient
-  // baseline" placeholder for whatever specific meetings it would have
-  // covered, rather than a correctness problem, but worth preserving the
-  // continuity. Deliberately unbounded (no 2-year-style cap) -- the
-  // storage cost for keeping this indefinitely is a few KB even over
-  // decades, and unlike price history, there's no external data-provider
-  // ceiling forcing a cutoff here.
-  'fomc_meeting_history',
+  // NOTE: fomc_meeting_history used to be listed here (unbounded, exported
+  // indefinitely as irreplaceable data). As of the 495 NY-Fed-official-
+  // source fix, every entry in that file is now either a genuinely
+  // resolved meeting sourced from the New York Fed's own published target-
+  // range history (re-derivable at any time -- the NY Fed API serves full
+  // history back to 1954) or a futures-implied fallback for a meeting the
+  // NY Fed data doesn't cover yet. Neither is irreplaceable the way this
+  // export list is meant for, so it's been moved to the routine, re-
+  // fetchable Clear Market Data Cache sweep below instead (see
+  // clearMarketDataCache). Losing it just means falling back to the honest
+  // "insufficient baseline" placeholder until it's rebuilt on the next
+  // live fetch, not a correctness problem.
   // The raw Fed Funds Futures contract data itself (not just the derived
   // self-healing rate above) -- exportable specifically so a successful
   // fetch on one device/instance can be transplanted into another that's
@@ -728,12 +765,492 @@ function shareExport(){
 
 let _parsedImportData=null;
 
+// ── Backup-import write-side validation (Phases 1-3, complete) ───────────────
+// Mirrors EXPORT_KEYS_STATIC and _buildExportData's prefix families above --
+// those already define what's durable/worth backing up; this defines what a
+// VALID value for each of those keys actually looks like, so confirmImport()
+// stops writing whatever a parsed backup file happens to contain. A key not
+// covered here (not in the registry, or its own value fails validation) is
+// dropped rather than written -- see _validateImportKeys below for exactly
+// how "dropped" is decided and reported.
+//
+// Phase 1: watchlist, income_accounts_meta + per-account positions/inputs,
+// fomc_meeting_dates_override, and the simple scalar settings in
+// EXPORT_KEYS_STATIC.
+// Phase 2: the historical-cache prefix families -- earnings_hist_/
+// earnings_confirmed_/earnings_pending_ (fully field-validated), and
+// multiple_hist_/fwdpe_track_/nextfy_hist_/nextfy_track_ (validated more
+// leniently -- see the comment above _finiteOrNull below for why).
+// Phase 3: fed_futures, watchlist_note_, rp_compare_, income_acct_*_mmf_yield
+// (found during Phase 3 scoping -- had silently fallen through every
+// earlier phase, since no prior prefix regex happened to match it), and
+// the legacy pre-account-migration flat keys (income_inputs, put_positions,
+// cc_positions, income_mmf_yields -- same shape as their per-account
+// equivalents, reusing the same validators).
+//
+// Every key EXPORT_KEYS_STATIC and _buildExportData's prefix sweep actually
+// produce is now covered by a validator. What's still NOT covered is a key
+// that isn't in this registry AT ALL -- see the comment on "unrecognized
+// entirely" in _validateImportKeys below for why that's still deliberately
+// passed through rather than rejected.
+
+// This codebase does NOT store toggle/checkbox settings as real JS
+// booleans -- confirmed by grepping each key's own READ-side comparison,
+// not assumed, after a real backup surfaced that an earlier version of
+// this registry had gotten six different keys wrong by assuming they
+// were (a literal true/false checker rejected every one of them, since
+// none were ever actually stored that way). Every key below that's
+// boolean-SHAPED is stored as one of a couple of string conventions
+// instead.
+function _validateStringBool(trueVal,falseVal){
+  return v=>(v===trueVal||v===falseVal)?v:null;
+}
+function _validateVolBadgeEntry(e){
+  if(!e||typeof e!=='object')return null;
+  const multiplier=_finiteOrNull(e.multiplier,{min:0,max:1000});
+  if(multiplier==null)return null;
+  if(typeof e.date!=='string'||!_isValidISODate(e.date))return null;
+  return{multiplier,date:e.date,liveTriggered:e.liveTriggered===true};
+}
+// vol_badge_state is a per-ticker OBJECT MAP ({AAPL:{...},MSFT:{...}}),
+// not a simple string -- another wrong assumption from the original pass.
+function _validateVolBadgeState(v){
+  if(!v||typeof v!=='object'||Array.isArray(v))return null;
+  const out={};
+  Object.entries(v).forEach(([ticker,entry])=>{
+    const nt=normalizeTicker(ticker);
+    if(!nt)return;
+    const validEntry=_validateVolBadgeEntry(entry);
+    if(validEntry)out[nt]=validEntry;
+  });
+  return out;
+}
+function _validateEnum(values){ return v=>values.includes(v)?v:null; }
+// For settings whose exact enum wasn't worth fully cataloging for Phase 1 --
+// still bounded and type-checked (never writes a non-string, never writes
+// something absurdly long), just not validated against a specific known set.
+function _validateSafeString(maxLen){ return v=>(typeof v==='string')?v.slice(0,maxLen):null; }
+
+function _validateTickerArray(v,maxLen){
+  if(!Array.isArray(v))return null;
+  const out=[];
+  for(const t of v){
+    const nt=normalizeTicker(t);
+    if(nt&&!out.includes(nt))out.push(nt);
+    if(out.length>=maxLen)break;
+  }
+  return out;
+}
+function _validateDateArray(v,maxLen){
+  if(!Array.isArray(v))return null;
+  const out=[];
+  for(const d of v){
+    if(typeof d==='string'&&_isValidISODate(d)&&!out.includes(d))out.push(d);
+    if(out.length>=maxLen)break;
+  }
+  return out;
+}
+function _validateConvictionWeights(v){
+  if(!v||typeof v!=='object')return null;
+  const keys=['ivr','rsi','range','apy','earnings','ma','upside','beta','oiGap'];
+  const out={};
+  keys.forEach(k=>{ out[k]=finiteNumber(v[k],{min:0,max:3,fallback:1.0}); });
+  return out;
+}
+function _validateAccountMeta(a){
+  if(!a||typeof a!=='object')return null;
+  if(typeof a.id!=='string'||!/^acct_[A-Za-z0-9_]{1,40}$/.test(a.id))return null;
+  if(typeof a.name!=='string'||!a.name.trim())return null;
+  return{id:a.id,name:a.name.slice(0,30)};
+}
+// Shared by both put and CC positions -- isCall adds the one CC-only field.
+function _validatePosition(p,isCall){
+  if(!p||typeof p!=='object')return null;
+  const ticker=normalizeTicker(p.ticker);
+  if(!ticker)return null;
+  const strike=finiteNumber(p.strike,{min:0.01,max:100000});
+  if(strike==null)return null;
+  if(typeof p.expDate!=='string'||!_isValidISODate(p.expDate))return null;
+  const contractsRaw=finiteNumber(p.contracts,{min:1,max:10000});
+  if(contractsRaw==null)return null;
+  const contracts=Math.round(contractsRaw);
+  // A malformed/missing id is regenerated rather than rejecting the whole
+  // position -- the id is an internal handle (used for roll-tracking and
+  // removal), not user data, so there's nothing to lose by giving it a
+  // fresh one.
+  const id=(typeof p.id==='string'&&/^pos_[A-Za-z0-9_]{1,30}$/.test(p.id))?p.id:('pos_'+Date.now()+'_'+Math.random().toString(36).slice(2,7));
+  const addedTs=(typeof p.addedTs==='string'&&!isNaN(Date.parse(p.addedTs)))?p.addedTs:new Date().toISOString();
+  const out={id,ticker,strike,expDate:p.expDate,contracts,addedTs};
+  if(typeof p.rolledAt==='string'&&!isNaN(Date.parse(p.rolledAt)))out.rolledAt=p.rolledAt;
+  if(isCall){
+    // Required, not optional -- the normal entry workflow (income.js)
+    // always requires a positive write price before a CC can even be
+    // created, and several render paths call .toFixed(2) on it directly
+    // with no guard. An optional field here let a malformed import
+    // produce a CC position that crashes on render or on the delete-
+    // confirmation dialog.
+    const spw=finiteNumber(p.stockPriceAtWrite,{min:0.01,max:100000,fallback:null});
+    if(spw==null)return null;
+    out.stockPriceAtWrite=spw;
+  }
+  return out;
+}
+function _validateIncomeInputs(v){
+  if(!v||typeof v!=='object')return null;
+  const num=(x,max)=>finiteNumber(x,{min:0,max:max||1e9,fallback:0});
+  return{
+    tbillAmt:num(v.tbillAmt), fdlxxAmt:num(v.fdlxxAmt), spaxxAmt:num(v.spaxxAmt),
+    spyiShares:num(v.spyiShares,1e9), nbosShares:num(v.nbosShares,1e9),
+    putsNotional:num(v.putsNotional), ccStockAmt:num(v.ccStockAmt),
+    targetAPY:finiteNumber(v.targetAPY,{min:0,max:500,fallback:12}),
+    fdlxxYieldManual:(v.fdlxxYieldManual==null)?null:finiteNumber(v.fdlxxYieldManual,{min:0,max:100,fallback:null}),
+    spaxxYieldManual:(v.spaxxYieldManual==null)?null:finiteNumber(v.spaxxYieldManual,{min:0,max:100,fallback:null}),
+    fdlxxUseManual:v.fdlxxUseManual===true,
+    spaxxUseManual:v.spaxxUseManual===true,
+  };
+}
+// Shared by both per-account (income_acct_ID_put_positions) and legacy flat
+// (put_positions, pre-migration) keys -- identical shape either way, since
+// the migration step just copies the flat key's value verbatim into the
+// per-account one (see runIncomeMigration in js/income.js).
+function _validatePutPositionsArray(v){ return Array.isArray(v)?v.map(p=>_validatePosition(p,false)).filter(Boolean).slice(0,1000):null; }
+function _validateCcPositionsArray(v){ return Array.isArray(v)?v.map(p=>_validatePosition(p,true)).filter(Boolean).slice(0,1000):null; }
+function _validateMmfYield(v){
+  if(!v||typeof v!=='object')return null;
+  return{
+    fdlxx:_finiteOrNull(v.fdlxx,{min:0,max:20}),
+    spaxx:_finiteOrNull(v.spaxx,{min:0,max:20}),
+    ts:(typeof v.ts==='string')?v.ts.slice(0,60):null,
+  };
+}
+// Duplicated rather than shared with market.js's own _MONTH_ABBR -- this
+// validator's own test harness loads settings.js in isolation (same
+// reasoning as _isValidISODate above being duplicated from the Worker).
+const _FED_FUTURES_MONTH_ORDER=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function _validateFedFuturesContract(c){
+  if(!c||typeof c!=='object')return null;
+  if(typeof c.month!=='string')return null;
+  const mm=c.month.match(/^([A-Za-z]{3}) (\d{4})$/);
+  // Must be a REAL month abbreviation, not just any 3 letters -- the
+  // original regex would have accepted "Foo 2026".
+  if(!mm||!_FED_FUTURES_MONTH_ORDER.includes(mm[1]))return null;
+  const impliedRate=finiteNumber(c.impliedRate,{min:-5,max:50}); // generous either side of any real-world Fed funds rate
+  if(impliedRate==null)return null;
+  const price=finiteNumber(c.price,{min:50,max:110}); // 100-impliedRate convention
+  if(price==null)return null;
+  const out={ticker:(typeof c.ticker==='string')?c.ticker.slice(0,20):null,month:c.month,price,impliedRate};
+  if(c.stale===true){
+    out.stale=true;
+    out.staleAsOf=(typeof c.staleAsOf==='string')?c.staleAsOf.slice(0,60):null;
+    out.staleAsOfEpoch=_finiteOrNull(c.staleAsOfEpoch,{min:0,max:Date.now()+31536000000});
+  }
+  return out;
+}
+function _fedFuturesMonthSortKey(monthLabel){
+  const mm=monthLabel.match(/^([A-Za-z]{3}) (\d{4})$/);
+  return parseInt(mm[2],10)*12+_FED_FUTURES_MONTH_ORDER.indexOf(mm[1]);
+}
+function _validateFedFutures(v){
+  if(!v||typeof v!=='object'||!Array.isArray(v.data))return null;
+  const seenMonths=new Set();
+  const contracts=v.data.map(_validateFedFuturesContract).filter(Boolean).filter(c=>{
+    if(seenMonths.has(c.month))return false; // dedup -- keep the first occurrence
+    seenMonths.add(c.month);
+    return true;
+  });
+  // Fed Watch's meeting-probability calculation processes months in
+  // chronological order -- each meeting-free month sets the baseline for
+  // whatever meeting comes next in that loop. A normal network fetch
+  // always builds this array in order already, but an imported backup
+  // isn't guaranteed to (a hand-edited or reordered file), so this is
+  // enforced here rather than trusted.
+  contracts.sort((a,b)=>_fedFuturesMonthSortKey(a.month)-_fedFuturesMonthSortKey(b.month));
+  return{
+    data:contracts.slice(0,20),
+    failedMonths:Array.isArray(v.failedMonths)?v.failedMonths.filter(m=>typeof m==='string').map(m=>m.slice(0,20)).slice(0,20):[],
+    ts:(typeof v.ts==='string')?v.ts.slice(0,60):'',
+    tsEpoch:_finiteOrNull(v.tsEpoch,{min:0,max:Date.now()+31536000000}),
+  };
+}
+
+const IMPORT_STATIC_VALIDATORS={
+  watchlist: v=>_validateTickerArray(v,500),
+  tz_pref: _validateEnum(['PT','UTC','local']),
+  font_size: v=>finiteNumber(v,{min:10,max:24}),
+  vix_threshold: v=>{const n=finiteNumber(v,{min:1,max:200});return n==null?null:Math.round(n);},
+  offline_mode: _validateStringBool('true','false'),
+  watchlist_sort: _validateEnum(['alpha','opportunity']),
+  heatmap_mode: _validateEnum(['off','change','ivr']),
+  watchlist_filter_mode: _validateEnum(['all','positions','starred']),
+  watchlist_starred: v=>_validateTickerArray(v,500),
+  put_pos_sort: _validateEnum(['ticker','expiry']),
+  cc_pos_sort: _validateEnum(['ticker','expiry']),
+  options_cutoff_et: v=>{const n=finiteNumber(v,{min:0,max:23});return n==null?null:Math.round(n);},
+  rp_earnings_toggle: _validateStringBool('on','off'),
+  rp_total_return: _validateStringBool('on','off'),
+  conviction_weights: _validateConvictionWeights,
+  earnings_view_mode: _validateEnum(['upcoming','recent']),
+  dashboard_view_mode: _validateEnum(['puts','cc','rsi','risk','gap','notes','wheelbt','valuation']),
+  vol_badge_state: _validateVolBadgeState,
+  last_ticker: v=>normalizeTicker(v),
+  etf_research_tickers: v=>_validateTickerArray(v,500),
+  income_accounts_meta: v=>{
+    if(!Array.isArray(v))return null;
+    const seenIds=new Set();
+    const out=[];
+    v.map(_validateAccountMeta).filter(Boolean).forEach(a=>{
+      // Two accounts sharing an id would both read/write the SAME
+      // per-account storage keys (income_acct_<id>_...) -- silently
+      // merging two distinct accounts into one. Keep the first, drop
+      // later duplicates, same as every other array validator here
+      // dropping one bad item rather than the whole key.
+      if(seenIds.has(a.id))return;
+      seenIds.add(a.id);
+      out.push(a);
+    });
+    return out.slice(0,50);
+  },
+  income_active_account: v=>(typeof v==='string'&&/^acct_[A-Za-z0-9_]{1,40}$/.test(v))?v:null,
+  income_migration_v1: v=>v==='1'?v:null, // only ever written as the literal string '1'; absent means not-yet-migrated
+  debug_options_fetch: _validateStringBool('true','false'),
+  prefetch_sleep_ms: v=>{const n=finiteNumber(v,{min:100,max:5000});return n==null?null:Math.round(n);},
+  fetch_upgrades_enabled: _validateStringBool('true','false'),
+  wheelbt_term_structure_enabled: _validateEnum(['true','false']),
+  // Dashboard notes genuinely have no length limit in normal live editing
+  // (confirmed against the actual save path -- no maxlength, no JS
+  // truncation; the Guide even says so explicitly). A 5000-char import
+  // cap would have silently truncated a real, legitimately long note on
+  // restore, contradicting that. 100,000 chars is still a real bound
+  // (guards against a pathological multi-megabyte value) but far beyond
+  // anything a person would plausibly type by hand.
+  dashboard_notes: _validateSafeString(100000),
+  bb_gap_overlay: _validateEnum(['on','off']),
+  gap_list_filter: _validateSafeString(30),
+  tax_state: v=>(typeof v==='string'&&/^[A-Z]{2}$/.test(v))?v:null,
+  state_tax_rate: v=>finiteNumber(v,{min:0,max:20}),
+  fomc_meeting_dates_override: v=>_validateDateArray(v,50),
+  fed_futures: _validateFedFutures,
+  // Legacy flat income keys (pre-account-migration backups) -- same shape
+  // as their per-account equivalents below, since runIncomeMigration just
+  // copies these verbatim into the per-account keyed versions.
+  income_inputs: _validateIncomeInputs,
+  income_mmf_yields: _validateMmfYield,
+  put_positions: _validatePutPositionsArray,
+  cc_positions: _validateCcPositionsArray,
+};
+
+// ── Phase 2: the historical-cache prefix families ────────────────────────────
+// earnings_hist_/confirmed_/pending_ have simple, fully-known shapes (a
+// small, fixed set of fields per entry, each a controlled-vocabulary
+// string, a date, or a small number) and get FULLY validated field-by-
+// field, same rigor as Phase 1.
+//
+// multiple_hist_/fwdpe_track_/nextfy_hist_/nextfy_track_ are different: per
+// the app's own comments where these are written (js/ticker.js), this data
+// is genuinely irreplaceable -- there's no historical forward-estimate
+// endpoint to re-derive it from. That raises the stakes of getting a strict
+// per-field validator WRONG (silently corrupting or dropping a real
+// historical record because one rarely-seen nested field's exact shape was
+// misjudged) higher than the stakes of validating it thoroughly. So these
+// get a deliberately different, LENIENT strategy: the fields that are
+// dates (used in comparisons elsewhere) or feed directly into arithmetic
+// (prices, EPS figures, P/E ratios) are validated and individually nulled
+// if invalid -- never rejecting the whole record over one bad number, the
+// same instinct as Phase 1's per-item array filtering, just applied at the
+// FIELD level here because a single record carries much more that would be
+// lost if the whole thing were discarded. The deeply-nested diagnostic
+// sub-objects (ttmComponents, yahooAnnual, priceCandidates, firstSeen,
+// lastSeen) get only a type check (a real object, not a string/array
+// pretending to be one) rather than a field-by-field validator, since
+// they're written once and read back only for on-screen debug/diagnostic
+// display (see the various JSON.stringify(...) debug views in
+// js/ticker.js), not fed into further calculations.
+
+function _finiteOrNull(x,opts){ return x==null?null:finiteNumber(x,{...opts,fallback:null}); }
+// Normalizes to a real object or an explicit null -- never passes through
+// undefined (checking-and-passing-through the original value would leave
+// an absent field as `undefined`, which JSON.stringify silently drops,
+// rather than a real, explicit null in the stored record).
+function _plainObjectOrNull(v){ return(v!=null&&typeof v==='object'&&!Array.isArray(v))?v:null; }
+// Shared by fwdpe_track_ and nextfy_hist_/nextfy_track_ entries -- both are
+// {date, <a handful of numeric fields>} records, just with different field
+// names.
+function _validateNumericEntry(en,numFields){
+  if(!en||typeof en!=='object')return null;
+  if(typeof en.date!=='string'||!_isValidISODate(en.date))return null;
+  const out={date:en.date};
+  numFields.forEach(f=>{ out[f]=_finiteOrNull(en[f],{min:-1e7,max:1e7}); });
+  return out;
+}
+
+function _validateEarningsHistEntry(e){
+  if(!e||typeof e!=='object')return null;
+  if(typeof e.date!=='string'||!_isValidISODate(e.date))return null;
+  const source=['auto-confirmed','gap-estimated','time-estimated','manual-override'].includes(e.source)?e.source:null;
+  if(!source)return null; // always set by the app -- absent/garbage means this entry isn't real
+  const out={
+    date:e.date,
+    hour:['bmo','amc'].includes(e.hour)?e.hour:null,
+    gapPct:_finiteOrNull(e.gapPct,{min:-100,max:1000}),
+    direction:['up','down'].includes(e.direction)?e.direction:null,
+    source,
+  };
+  if(e.override&&typeof e.override==='object'&&typeof e.override.date==='string'&&_isValidISODate(e.override.date)){
+    out.override={date:e.override.date,hour:['bmo','amc'].includes(e.override.hour)?e.override.hour:null};
+  }
+  return out;
+}
+function _validateEarningsHist(v){
+  if(!v||typeof v!=='object'||!Array.isArray(v.data))return null;
+  return{
+    data:v.data.map(_validateEarningsHistEntry).filter(Boolean).slice(0,500),
+    ts:(typeof v.ts==='string')?v.ts.slice(0,60):'',
+    tsEpoch:_finiteOrNull(v.tsEpoch,{min:0,max:Date.now()+31536000000}),
+  };
+}
+function _validateEarningsConfirmed(v){
+  if(!Array.isArray(v))return null;
+  return v.filter(e=>e&&typeof e==='object'&&typeof e.date==='string'&&_isValidISODate(e.date))
+    .map(e=>({date:e.date,hour:['bmo','amc'].includes(e.hour)?e.hour:null,addedTs:(typeof e.addedTs==='string')?e.addedTs.slice(0,60):null}))
+    .slice(0,20);
+}
+function _validateEarningsPending(v){
+  if(!Array.isArray(v))return null;
+  return v.filter(e=>e&&typeof e==='object'&&typeof e.date==='string'&&_isValidISODate(e.date))
+    .map(e=>({date:e.date,hour:['bmo','amc'].includes(e.hour)?e.hour:null,savedTs:(typeof e.savedTs==='string')?e.savedTs.slice(0,60):null}))
+    .slice(0,10);
+}
+
+function _validateMultipleHistEntry(e){
+  if(!e||typeof e!=='object')return null;
+  if(typeof e.quarterEndDate!=='string'||!_isValidISODate(e.quarterEndDate))return null; // the one required/anchor field
+  return{
+    quarterEndDate:e.quarterEndDate,
+    reportDate:(typeof e.reportDate==='string'&&_isValidISODate(e.reportDate))?e.reportDate:null,
+    reportHour:['bmo','amc'].includes(e.reportHour)?e.reportHour:null,
+    reportDateSource:(typeof e.reportDateSource==='string')?e.reportDateSource.slice(0,30):null,
+    reportDateWasOverride:e.reportDateWasOverride===true,
+    priceAtReport:_finiteOrNull(e.priceAtReport,{min:0,max:1e7}),
+    priceCandidates:_plainObjectOrNull(e.priceCandidates),
+    ttmEpsAsOfReport:_finiteOrNull(e.ttmEpsAsOfReport,{min:-1e6,max:1e6}),
+    ttmComponents:_plainObjectOrNull(e.ttmComponents),
+    ttmPE:_finiteOrNull(e.ttmPE,{min:-10000,max:10000}),
+    epsActual:_finiteOrNull(e.epsActual,{min:-1e6,max:1e6}),
+    epsEstimateQuarterly:_finiteOrNull(e.epsEstimateQuarterly,{min:-1e6,max:1e6}),
+    yahooAnnual:_plainObjectOrNull(e.yahooAnnual),
+    firstSeen:_plainObjectOrNull(e.firstSeen),
+    lastSeen:_plainObjectOrNull(e.lastSeen),
+  };
+}
+function _validateMultipleHist(v){
+  return Array.isArray(v)?v.map(_validateMultipleHistEntry).filter(Boolean).slice(0,200):null;
+}
+const _FWDPE_ENTRY_NUM_FIELDS=['price','quarterlyEpsEst','projTtmEps','forwardPE','yahooAnnualFwdEps','yahooForwardPE'];
+function _validateFwdpeTrackGroup(g){
+  if(!g||typeof g!=='object')return null;
+  if(typeof g.targetQuarterEnd!=='string'||!_isValidISODate(g.targetQuarterEnd))return null;
+  const entries=Array.isArray(g.entries)?g.entries.map(en=>_validateNumericEntry(en,_FWDPE_ENTRY_NUM_FIELDS)).filter(Boolean).slice(0,50):[];
+  return{targetQuarterEnd:g.targetQuarterEnd,entries};
+}
+function _validateFwdpeTrack(v){
+  return Array.isArray(v)?v.map(_validateFwdpeTrackGroup).filter(Boolean).slice(0,10):null;
+}
+
+const _NEXTFY_ENTRY_NUM_FIELDS=['price','nextFYEps','multiple'];
+function _validateNextfyHistEntry(h){
+  if(!h||typeof h!=='object')return null;
+  if(typeof h.fyEndDate!=='string'||!_isValidISODate(h.fyEndDate))return null;
+  return{
+    fyEndDate:h.fyEndDate,
+    resolvedDate:(typeof h.resolvedDate==='string'&&_isValidISODate(h.resolvedDate))?h.resolvedDate:null,
+    entries:Array.isArray(h.entries)?h.entries.map(en=>_validateNumericEntry(en,_NEXTFY_ENTRY_NUM_FIELDS)).filter(Boolean).slice(0,50):[],
+  };
+}
+function _validateNextfyHist(v){
+  return Array.isArray(v)?v.map(_validateNextfyHistEntry).filter(Boolean).slice(0,50):null;
+}
+function _validateNextfyTrack(v){
+  if(!v||typeof v!=='object')return null;
+  if(typeof v.targetFYEnd!=='string'||!_isValidISODate(v.targetFYEnd))return null;
+  return{
+    targetFYEnd:v.targetFYEnd,
+    entries:Array.isArray(v.entries)?v.entries.map(en=>_validateNumericEntry(en,_NEXTFY_ENTRY_NUM_FIELDS)).filter(Boolean).slice(0,50):[],
+    pendingFYEnd:(typeof v.pendingFYEnd==='string'&&_isValidISODate(v.pendingFYEnd))?v.pendingFYEnd:null,
+  };
+}
+
+const IMPORT_PREFIX_VALIDATORS=[
+  {test:k=>/^income_acct_[A-Za-z0-9_]{1,40}_put_positions$/.test(k), validate:_validatePutPositionsArray},
+  {test:k=>/^income_acct_[A-Za-z0-9_]{1,40}_cc_positions$/.test(k), validate:_validateCcPositionsArray},
+  {test:k=>/^income_acct_[A-Za-z0-9_]{1,40}_inputs$/.test(k), validate:_validateIncomeInputs},
+  // Found while scoping Phase 3: this family was never matched by any
+  // Phase 1/2 prefix regex (all three of those end in _put_positions$/
+  // _cc_positions$/_inputs$, none of which match _mmf_yield$), so it had
+  // been silently falling through to the unvalidated pass-through branch
+  // since Phase 1 shipped, despite being genuine per-account data covered
+  // by the export side's generic income_acct_ prefix sweep.
+  {test:k=>/^income_acct_[A-Za-z0-9_]{1,40}_mmf_yield$/.test(k), validate:_validateMmfYield},
+  {test:k=>/^earnings_hist_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:_validateEarningsHist},
+  {test:k=>/^earnings_confirmed_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:_validateEarningsConfirmed},
+  {test:k=>/^earnings_pending_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:_validateEarningsPending},
+  {test:k=>/^multiple_hist_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:_validateMultipleHist},
+  {test:k=>/^fwdpe_track_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:_validateFwdpeTrack},
+  {test:k=>/^nextfy_hist_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:_validateNextfyHist},
+  {test:k=>/^nextfy_track_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:_validateNextfyTrack},
+  {test:k=>/^watchlist_note_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:v=>(typeof v==='string')?v.slice(0,500):null},
+  {test:k=>/^rp_compare_[A-Za-z0-9^.-]{1,15}$/.test(k), validate:v=>normalizeTicker(v)},
+];
+
+// Walks every key in a parsed backup file's `keys` object and validates it
+// against the registries above. A key not in either registry at all --
+// unrecognized entirely -- and a key whose value fails its own validator --
+// recognized, but malformed -- are both dropped, with a reason recorded for
+// each so the person restoring a backup can see what happened rather than
+// silently losing data. One bad key (or one bad ITEM inside an array key,
+// since the array validators above already filter per-item) never blocks
+// the rest of an otherwise-good backup from importing.
+function _validateImportKeys(keys){
+  const accepted={};
+  const rejected=[];
+  Object.entries(keys||{}).forEach(([k,v])=>{
+    if(Object.prototype.hasOwnProperty.call(IMPORT_STATIC_VALIDATORS,k)){
+      const result=IMPORT_STATIC_VALIDATORS[k](v);
+      if(result!=null)accepted[k]=result;
+      else rejected.push({key:k,reason:'malformed value'});
+      return;
+    }
+    const prefixMatch=IMPORT_PREFIX_VALIDATORS.find(p=>p.test(k));
+    if(prefixMatch){
+      const result=prefixMatch.validate(v);
+      if(result!=null)accepted[k]=result;
+      else rejected.push({key:k,reason:'malformed value'});
+      return;
+    }
+    // Reaching here means the key is genuinely unrecognized -- every
+    // durable key EXPORT_KEYS_STATIC/_buildExportData actually produces
+    // is now covered by a validator as of Phase 3. Still passed through
+    // unvalidated rather than rejected: rejecting outright would require
+    // being CERTAIN this registry is exhaustive, and a person's own
+    // export from a future build (a new key this build doesn't know
+    // about yet) shouldn't be treated as hostile just because it's newer
+    // than this code.
+    accepted[k]=v;
+  });
+  return{accepted,rejected};
+}
+
 function previewImport(){
   const raw=document.getElementById('import-textarea').value.trim();
   if(!raw){toast('Paste JSON backup first');return;}
+  // Generous either side of any realistic backup this app would actually
+  // produce (even a heavy user's full cache across many tickers is well
+  // under this), tight enough to stop a pathological or malicious file
+  // from freezing the browser on JSON.parse or flooding storage.
+  if(raw.length>20*1024*1024){toast('Backup file too large (max 20MB) -- not parsed');return;}
   let parsed;
   try{parsed=JSON.parse(raw);}catch(e){toast('Invalid JSON — could not parse backup');return;}
   if(!parsed.keys||typeof parsed.keys!=='object'){toast('Invalid backup format — missing keys');return;}
+  if(Object.keys(parsed.keys).length>5000){toast('Backup has too many keys (max 5000) -- not restored');return;}
   _parsedImportData=parsed;
 
   const keys=parsed.keys;
@@ -747,7 +1264,7 @@ function previewImport(){
   try{
     const wl=Array.isArray(keys.watchlist)?keys.watchlist:(JSON.parse(keys.watchlist||'[]'));
     lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">WATCHLIST ('+wl.length+' tickers)</span>');
-    lines.push('<div style="color:var(--text2);padding-left:10px">'+wl.join(', ')+'</div></div>');
+    lines.push('<div style="color:var(--text2);padding-left:10px">'+wl.map(t=>_escHtml(t)).join(', ')+'</div></div>');
   }catch{}
 
   // Earnings overrides
@@ -760,8 +1277,8 @@ function previewImport(){
       const overrides=(hist.data||[]).filter(e=>e.override);
       if(overrides.length){
         earningsSummary.push('<div style="color:var(--text2);padding-left:10px">'+
-          ticker+': '+overrides.length+' override'+(overrides.length>1?'s':'')+' — '+
-          overrides.map(e=>e.override.date+(e.override.hour?' '+e.override.hour.toUpperCase():'')).join(', ')+
+          _escHtml(ticker)+': '+overrides.length+' override'+(overrides.length>1?'s':'')+' — '+
+          overrides.map(e=>_escHtml(e.override.date+(e.override.hour?' '+String(e.override.hour).toUpperCase():''))).join(', ')+
         '</div>');
       }
     }catch{}
@@ -784,7 +1301,7 @@ function previewImport(){
         lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">PUT POSITIONS ('+puts.length+')</span>');
         puts.forEach(p=>{
           lines.push('<div style="color:var(--text2);padding-left:10px">'+
-            p.ticker+' $'+p.strike+' put · exp '+p.expDate+' · '+p.contracts+' contract'+(p.contracts>1?'s':'')+
+            _escHtml(p.ticker)+' $'+_escHtml(p.strike)+' put · exp '+_escHtml(p.expDate)+' · '+_escHtml(p.contracts)+' contract'+(p.contracts>1?'s':'')+
           '</div>');
         });
         lines.push('</div>');
@@ -797,8 +1314,8 @@ function previewImport(){
         lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">COVERED CALL POSITIONS ('+ccs.length+')</span>');
         ccs.forEach(p=>{
           lines.push('<div style="color:var(--text2);padding-left:10px">'+
-            p.ticker+' $'+p.strike+' call · exp '+p.expDate+' · '+p.contracts+' contract'+(p.contracts>1?'s':'')+
-            ' · written @ $'+p.stockPriceAtWrite+
+            _escHtml(p.ticker)+' $'+_escHtml(p.strike)+' call · exp '+_escHtml(p.expDate)+' · '+_escHtml(p.contracts)+' contract'+(p.contracts>1?'s':'')+
+            ' · written @ $'+_escHtml(p.stockPriceAtWrite)+
           '</div>');
         });
         lines.push('</div>');
@@ -822,7 +1339,7 @@ function previewImport(){
           const incKey = 'income_'+a.id+'_inputs';
           const inc = (keys[incKey]&&typeof keys[incKey]==='object') ? keys[incKey] : (keys[incKey] ? JSON.parse(String(keys[incKey])) : {});
           // Account header line
-          lines.push('<div style="color:var(--accent);padding-left:10px;margin-top:6px;font-weight:600">'+a.name+'</div>');
+          lines.push('<div style="color:var(--accent);padding-left:10px;margin-top:6px;font-weight:600">'+_escHtml(a.name)+'</div>');
           // Layer 1 summary if configured
           if(inc.tbillAmt||inc.fdlxxAmt||inc.spaxxAmt){
             const l1Parts=[];
@@ -836,7 +1353,7 @@ function previewImport(){
             lines.push('<div style="color:var(--text2);padding-left:20px">Puts ('+puts.length+'):</div>');
             puts.forEach(p=>{
               lines.push('<div style="color:var(--text2);padding-left:30px">'+
-                p.ticker+' $'+p.strike+' · exp '+p.expDate+' · '+p.contracts+' contract'+(p.contracts>1?'s':'')+
+                _escHtml(p.ticker)+' $'+_escHtml(p.strike)+' · exp '+_escHtml(p.expDate)+' · '+_escHtml(p.contracts)+' contract'+(p.contracts>1?'s':'')+
               '</div>');
             });
           }else{
@@ -847,14 +1364,14 @@ function previewImport(){
             lines.push('<div style="color:var(--text2);padding-left:20px">CCs ('+ccs.length+'):</div>');
             ccs.forEach(p=>{
               lines.push('<div style="color:var(--text2);padding-left:30px">'+
-                p.ticker+' $'+p.strike+' call · exp '+p.expDate+' · '+p.contracts+' contract'+(p.contracts>1?'s':'')+
-                (p.stockPriceAtWrite?' · written @ $'+p.stockPriceAtWrite:'')+
+                _escHtml(p.ticker)+' $'+_escHtml(p.strike)+' call · exp '+_escHtml(p.expDate)+' · '+_escHtml(p.contracts)+' contract'+(p.contracts>1?'s':'')+
+                (p.stockPriceAtWrite?' · written @ $'+_escHtml(p.stockPriceAtWrite):'')+
               '</div>');
             });
           }else{
             lines.push('<div style="color:var(--text3);padding-left:20px">No CC positions</div>');
           }
-        }catch(e){ lines.push('<div style="color:var(--text2);padding-left:10px">'+a.name+': (data unreadable)</div>'); }
+        }catch(e){ lines.push('<div style="color:var(--text2);padding-left:10px">'+_escHtml(a.name)+': (data unreadable)</div>'); }
       });
       lines.push('</div>');
     }else if(keys.income_inputs||keys.put_positions||keys.cc_positions){
@@ -866,8 +1383,8 @@ function previewImport(){
         const ccs=Array.isArray(keys.cc_positions)?keys.cc_positions:(keys.cc_positions?JSON.parse(String(keys.cc_positions)):[]);
         if(inc.tbillAmt)lines.push('<div style="color:var(--text2);padding-left:10px">T-Bills: $'+Number(inc.tbillAmt).toLocaleString()+'</div>');
         if(inc.fdlxxAmt)lines.push('<div style="color:var(--text2);padding-left:10px">FDLXX: $'+Number(inc.fdlxxAmt).toLocaleString()+'</div>');
-        puts.forEach(p=>lines.push('<div style="color:var(--text2);padding-left:10px">'+p.ticker+' $'+p.strike+' put · exp '+p.expDate+' · '+p.contracts+' contract'+(p.contracts>1?'s':'')+'</div>'));
-        ccs.forEach(p=>lines.push('<div style="color:var(--text2);padding-left:10px">'+p.ticker+' $'+p.strike+' call · exp '+p.expDate+' · '+p.contracts+' contract'+(p.contracts>1?'s':'')+(p.stockPriceAtWrite?' · written @ $'+p.stockPriceAtWrite:'')+'</div>'));
+        puts.forEach(p=>lines.push('<div style="color:var(--text2);padding-left:10px">'+_escHtml(p.ticker)+' $'+_escHtml(p.strike)+' put · exp '+_escHtml(p.expDate)+' · '+_escHtml(p.contracts)+' contract'+(p.contracts>1?'s':'')+'</div>'));
+        ccs.forEach(p=>lines.push('<div style="color:var(--text2);padding-left:10px">'+_escHtml(p.ticker)+' $'+_escHtml(p.strike)+' call · exp '+_escHtml(p.expDate)+' · '+_escHtml(p.contracts)+' contract'+(p.contracts>1?'s':'')+(p.stockPriceAtWrite?' · written @ $'+_escHtml(p.stockPriceAtWrite):'')+'</div>'));
       }catch{}
       lines.push('</div>');
     }
@@ -875,8 +1392,8 @@ function previewImport(){
 
   // Settings
   lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">SETTINGS</span>');
-  if(keys.tz_pref)lines.push('<div style="color:var(--text2);padding-left:10px">Timezone: '+keys.tz_pref+'</div>');
-  if(keys.font_size)lines.push('<div style="color:var(--text2);padding-left:10px">Font size: '+keys.font_size+'px</div>');
+  if(keys.tz_pref)lines.push('<div style="color:var(--text2);padding-left:10px">Timezone: '+_escHtml(keys.tz_pref)+'</div>');
+  if(keys.font_size)lines.push('<div style="color:var(--text2);padding-left:10px">Font size: '+_escHtml(keys.font_size)+'px</div>');
   if(keys.options_cutoff_et){
     const cutoffHourET=typeof keys.options_cutoff_et==='number'?keys.options_cutoff_et:parseInt(String(keys.options_cutoff_et));
     // Display in user's timezone (same as Settings dropdown), not raw ET
@@ -897,7 +1414,7 @@ function previewImport(){
   if(keys.conviction_weights){
     try{
       const cw=(keys.conviction_weights&&typeof keys.conviction_weights==='object')?keys.conviction_weights:JSON.parse(keys.conviction_weights);
-      const cwStr=Object.entries(cw).map(([k,v])=>k+':'+v).join(', ');
+      const cwStr=Object.entries(cw).map(([k,v])=>_escHtml(k)+':'+_escHtml(v)).join(', ');
       lines.push('<div style="color:var(--text2);padding-left:10px">Conviction weights: '+cwStr+'</div>');
     }catch{}
   }
@@ -911,7 +1428,7 @@ function previewImport(){
       _confKeys.forEach(k=>{
         const t=k.replace('earnings_confirmed_','');
         const entries=Array.isArray(keys[k])?keys[k]:(JSON.parse(keys[k]||'[]'));
-        if(entries.length)lines.push('<div style="color:var(--text2);padding-left:10px">'+t+': '+entries.length+' confirmed date'+(entries.length>1?'s':'')+' ('+entries.map(e=>e.date+(e.hour?' '+e.hour.toUpperCase():'')).join(', ')+')</div>');
+        if(entries.length)lines.push('<div style="color:var(--text2);padding-left:10px">'+_escHtml(t)+': '+entries.length+' confirmed date'+(entries.length>1?'s':'')+' ('+entries.map(e=>_escHtml(e.date+(e.hour?' '+String(e.hour).toUpperCase():''))).join(', ')+')</div>');
       });
       lines.push('</div>');
     }
@@ -925,7 +1442,7 @@ function previewImport(){
     if(typeof keys.dashboard_notes==='string'&&keys.dashboard_notes.trim()){
       const note=keys.dashboard_notes;
       lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">NOTES ('+note.length+' char'+(note.length!==1?'s':'')+')</span>');
-      lines.push('<div style="color:var(--text2);padding-left:10px">'+note.slice(0,100).replace(/</g,'&lt;').replace(/>/g,'&gt;')+(note.length>100?'…':'')+'</div></div>');
+      lines.push('<div style="color:var(--text2);padding-left:10px">'+_escHtml(note.slice(0,100))+(note.length>100?'…':'')+'</div></div>');
     }
   }catch{}
 
@@ -937,7 +1454,7 @@ function previewImport(){
       lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">WATCHLIST NOTES ('+tickers.length+' ticker'+(tickers.length!==1?'s':'')+')</span>');
       tickers.forEach(t=>{
         const note=typeof keys['watchlist_note_'+t]==='string'?keys['watchlist_note_'+t]:'';
-        lines.push('<div style="color:var(--text2);padding-left:10px">'+t+': '+note.slice(0,60)+(note.length>60?'…':'')+'</div>');
+        lines.push('<div style="color:var(--text2);padding-left:10px">'+_escHtml(t)+': '+_escHtml(note.slice(0,60))+(note.length>60?'…':'')+'</div>');
       });
       lines.push('</div>');
     }
@@ -948,12 +1465,23 @@ function previewImport(){
     const sbT=Array.isArray(keys.etf_research_tickers)?keys.etf_research_tickers:(JSON.parse(keys.etf_research_tickers||'[]'));
     if(sbT.length){
       lines.push('<div style="margin-bottom:6px"><span style="color:var(--text3)">ETF RESEARCH SANDBOX ('+sbT.length+' ticker'+(sbT.length>1?'s':'')+')</span>');
-      lines.push('<div style="color:var(--text2);padding-left:10px">'+sbT.join(', ')+'</div></div>');
+      lines.push('<div style="color:var(--text2);padding-left:10px">'+sbT.map(t=>_escHtml(t)).join(', ')+'</div></div>');
     }
   }catch{}
 
-  // Total key count
+  // Total key count, plus what validation actually found -- shown BEFORE
+  // the user taps Restore, not just reported afterward, so a skipped key
+  // isn't a surprise.
+  const{rejected}=_validateImportKeys(keys);
   lines.push('<div style="color:var(--text3);margin-top:4px;border-top:1px solid var(--border);padding-top:6px">'+Object.keys(keys).length+' keys total in backup.</div>');
+  if(rejected.length){
+    const shown=rejected.slice(0,10);
+    lines.push('<div style="color:var(--warn);margin-top:2px">'+rejected.length+' key'+(rejected.length!==1?'s':'')+' will be skipped (unrecognized or malformed):</div>');
+    lines.push('<div style="color:var(--text3);padding-left:10px;font-size:10px">'+
+      shown.map(r=>_escHtml(r.key)+' ('+_escHtml(r.reason)+')').join('<br>')+
+      (rejected.length>shown.length?'<br>… and '+(rejected.length-shown.length)+' more':'')+
+    '</div>');
+  }
 
   const preview=document.getElementById('import-preview');
   preview.innerHTML=lines.join('');
@@ -965,14 +1493,34 @@ function previewImport(){
 function confirmImport(){
   if(!_parsedImportData?.keys){toast('No valid backup to restore');return;}
   const keys=_parsedImportData.keys;
+  const{accepted,rejected}=_validateImportKeys(keys);
   let count=0;
-  Object.entries(keys).forEach(([k,v])=>{
-    try{S.set(k,v);count++;}catch(e){console.warn('Import failed for key',k,e);}
-  });
+  const failed=[];
+  let stoppedEarly=false;
+  for(const[k,v]of Object.entries(accepted)){
+    if(stoppedEarly){failed.push(k);continue;}
+    // S.set returns false on ANY write failure (quota exceeded, private-
+    // mode SecurityError, an unserializable value) -- it never throws, so
+    // the old try/catch here never actually caught anything, and every
+    // key silently counted as "restored" even when the write failed.
+    if(S.set(k,v)){
+      count++;
+    }else{
+      failed.push(k);
+      // Once one write has genuinely failed, storage is very likely
+      // still full (or in whatever state caused the failure) for every
+      // remaining key too -- stop attempting them rather than burning
+      // through the rest of a large import one doomed write at a time.
+      // S.set also fires its own "storage full" toast on every quota
+      // failure with no once-per-session guard, so continuing would mean
+      // the person sees that toast fire repeatedly in a row.
+      stoppedEarly=true;
+    }
+  }
   // If this is a pre-migration backup (has old flat keys, no income_accounts_meta),
   // clear the migration flag so runIncomeMigration() re-runs on next income tab load
-  const isPreMigration = !keys.income_accounts_meta &&
-    (keys.income_inputs || keys.put_positions || keys.cc_positions);
+  const isPreMigration = !accepted.income_accounts_meta &&
+    (accepted.income_inputs || accepted.put_positions || accepted.cc_positions);
   if(isPreMigration){
     S.del('income_migration_v1');
     console.log('Pre-migration backup detected -- income migration will re-run on next income tab load');
@@ -982,7 +1530,11 @@ function confirmImport(){
   document.getElementById('import-preview').style.display='none';
   document.getElementById('import-textarea').value='';
   closeDataPortabilityModal();
-  toast('Restored '+count+' keys. Reload the app to apply.',4000);
+  const noteParts=[];
+  if(rejected.length)noteParts.push(rejected.length+' skipped (unrecognized/malformed)');
+  if(failed.length)noteParts.push(failed.length+' FAILED TO SAVE -- storage may be full; try Clear Market Data Cache in Settings, then re-import');
+  const toastMsg='Restored '+count+' key'+(count!==1?'s':'')+(noteParts.length?' ('+noteParts.join('; ')+')':'')+'. Reload the app to apply.';
+  toast(toastMsg,failed.length?9000:(rejected.length?6000:4000));
 }
 
 // ── Refresh Health Badge & Modal ──────────────────────────────────────────
@@ -1041,7 +1593,17 @@ function openRefreshHealthModal(){
     :'';
 
   const tickerRows=Object.entries(h.tickers||{}).map(([t,v])=>{
-    const coreOk=v.snap&&v.hist&&v.finnhub;
+    // Must match prefetch.js's _coreOk EXACTLY -- these two are meant to
+    // represent the same concept (the summary's N/total count and each
+    // row's own badge), and previously didn't: this row-level check used
+    // to omit options entirely, so a ticker whose options data failed
+    // (metadata unavailable, or some expiration fetches came back with
+    // nothing usable to fall back on) could show a green "OK" row here
+    // while still being correctly counted as the failure behind a "46/47"
+    // summary above it -- invisible in the one place meant to show which
+    // ticker that was, with its own explanatory detail line suppressed
+    // too (that line only renders when the row ISN'T "OK").
+    const coreOk=v.snap&&v.hist&&v.finnhub&&v.options===true;
     const isDegraded=coreOk&&v.summaryDegraded;
     // Three states, not two: fully OK, degraded (core data fine, but
     // sector/beta/PEG/price targets/etc. are carried over from an earlier
@@ -1053,7 +1615,7 @@ function openRefreshHealthModal(){
     const detail=[
       v.snap?'':'snap failed',
       v.hist?'':'hist failed',
-      v.options===true?'':v.options==='skipped'?'options skipped (fresh)':'options failed',
+      v.options===true?'':v.options==='skipped'?'options skipped (fresh)':v.optionsExpDetail?`options ${v.optionsExpDetail.fresh+v.optionsExpDetail.preserved}/${v.optionsExpDetail.total} exp chains`:'options failed',
       v.finnhub?'':(v.finnhubDetail?v.finnhubDetail:'finnhub failed'),
       isDegraded?'valuation data (sector/beta/PEG/price targets) is from an earlier fetch, not this one':'',
     ].filter(Boolean).join(', ');

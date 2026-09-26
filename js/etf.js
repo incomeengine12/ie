@@ -179,7 +179,7 @@ async function loadETFTab(){
         snap={ticker:etf.ticker,price:_etfQ.price,change:_etfQ.price-(_etfQ.prevClose||_etfQ.price),changePct:((_etfQ.price-(_etfQ.prevClose||_etfQ.price))/(_etfQ.prevClose||_etfQ.price)*100),week52High:_etfQ.week52High||null,week52Low:_etfQ.week52Low||null,dividendYield:_etfQ.dividendYield!=null?_etfQ.dividendYield*100:null,ts:nowPT(),tsEpoch:Date.now()};
         S.set(snapKey,snap);
       }catch{const c=S.get(snapKey);if(c){snap=c;isLive=false;showOfflineBanner(c.ts,c.tsEpoch);}else snap=null;}
-      try{hist6mo=await yahooHistory(etf.ticker,'1y','1d');S.set(histKey,{timestamps:hist6mo.timestamps.map(d=>d.toISOString()),closes:hist6mo.closes,ts:nowPT()});}
+      try{hist6mo=await yahooHistory(etf.ticker,'1y','1d');S.set(histKey,{timestamps:hist6mo.timestamps.map(d=>d.toISOString()),closes:hist6mo.closes,ts:nowPT(),tsEpoch:Date.now()});}
       catch{const ch=S.get(histKey);if(ch)hist6mo={timestamps:ch.timestamps.map(d=>new Date(d)),closes:ch.closes};}
       try{
         // Fetch ETF distribution history from Yahoo Finance via Worker
@@ -198,8 +198,11 @@ async function loadETFTab(){
                 amount:d.amount
               }));
             distributions=divList;
-            S.set(divKey,{distributions,ts:nowPT()});
-            // Trailing 12-month yield: sum last 12 distributions / current price
+            S.set(divKey,{distributions,ts:nowPT(),tsEpoch:Date.now()});
+            // "Trailing 12-month" yield by distribution COUNT, not literal
+            // calendar months -- the same thing for a fund that reliably
+            // pays every month, but if one was ever skipped, these 12
+            // payments span more than 12 actual months (see the Guide).
             const last12=divList.slice(0,12);
             const total=last12.reduce((s,d)=>s+(d.amount||0),0);
             if(snap?.price&&total>0)trailingYield=(total/snap.price*100).toFixed(2);
@@ -209,15 +212,18 @@ async function loadETFTab(){
       }catch{const cd=S.get(divKey);if(cd){distributions=cd.distributions||[];const total=distributions.slice(0,12).reduce((s,d)=>s+(d.amount||0),0);if(snap?.price&&total>0)trailingYield=(total/snap.price*100).toFixed(2);}}
       // Top holdings (24h cache gate)
       let holdings=[],alloc=null,bond=null,ratings=[];
-      const _holdAge=(Date.now()-(S.get(holdKey)?.ts?new Date(S.get(holdKey).ts).getTime():0))/3600000;
+      const _holdAge=_recAgeHrs(S.get(holdKey)); // Infinity when missing/unparseable => refetch
       if(_holdAge>=24){
         const _h=await fetchTopHoldings(etf.ticker).catch(()=>null);
-        if(_h){holdings=_h.holdings||[];alloc=_h.alloc||null;bond=_h.bond||null;ratings=_h.ratings||[];S.set(holdKey,{holdings,alloc,bond,ratings,ts:nowPT()});}
+        if(_h){holdings=_h.holdings||[];alloc=_h.alloc||null;bond=_h.bond||null;ratings=_h.ratings||[];S.set(holdKey,{holdings,alloc,bond,ratings,ts:nowPT(),tsEpoch:Date.now()});}
       }else{const _hc=S.get(holdKey);if(_hc){holdings=_hc.holdings||[];alloc=_hc.alloc||null;bond=_hc.bond||null;ratings=_hc.ratings||[];}}
       const chartLabels=hist6mo?hist6mo.timestamps.slice(-126).map(d=>{if(!(d instanceof Date))d=new Date(d);return d.toLocaleDateString('en-US',{month:'short',day:'numeric'});}):[];
       const chartData=hist6mo?hist6mo.closes.slice(-126):[];
-      // Compute total return series: price + cumulative distributions reinvested
-      // Map distribution dates to cumulative sum, then add to price on each date
+      // Compute total return series: price + cumulative CASH distributions
+      // added -- an approximation of total return, NOT actual share
+      // reinvestment (which would compound by buying more shares with each
+      // distribution). Map distribution dates to cumulative sum, then add
+      // to price on each date.
       let totalReturnData=[];
       if(hist6mo&&hist6mo.timestamps&&distributions.length){
         let cumDist=0;
@@ -292,13 +298,13 @@ async function loadETFTab(){
         chartData6m:chartData,
         labels1y,data1y,tr1y:totalReturn1y,
         priceRetPct1y,totalRetPct1y,
-        ts:nowPT()
+        ts:nowPT(),tsEpoch:Date.now()
       });
       etfChartQueue.push({ticker:etf.ticker,color:etf.color,labels:chartLabels,data:chartData,totalReturn:totalReturnData,priceRetPct,totalRetPct,labels1y,data1y,tr1y:totalReturn1y,priceRetPct1y,totalRetPct1y});
     }catch(err){html+=`<div class="card"><div style="font-family:var(--mono);font-size:12px;color:var(--red)">${etf.ticker}: ${err.message}</div></div>`;}
   }
   el.innerHTML=html;
-  S.set('etf_rendered',{html,ts:nowPT()});
+  S.set('etf_rendered',{html,ts:nowPT(),tsEpoch:Date.now()});
   // Render all ETF charts after HTML is in DOM -- use requestAnimationFrame to ensure paint
   window._etfChartData=window._etfChartData||{};
 
@@ -487,17 +493,17 @@ async function _sbFetch(ticker){
   // Top holdings (24h cache gate)
   let holdings=[],alloc=null,bond=null,ratings=[];
   const _sbHoldKey='etf_holdings_'+ticker;
-  const _sbHoldAge=(Date.now()-(S.get(_sbHoldKey)?.ts?new Date(S.get(_sbHoldKey).ts).getTime():0))/3600000;
+  const _sbHoldAge=_recAgeHrs(S.get(_sbHoldKey)); // Infinity when missing/unparseable => refetch
   if(_sbHoldAge>=24){
     const _h=await fetchTopHoldings(ticker).catch(()=>null);
-    if(_h){holdings=_h.holdings||[];alloc=_h.alloc||null;bond=_h.bond||null;ratings=_h.ratings||[];S.set(_sbHoldKey,{holdings,alloc,bond,ratings,ts:nowPT()});}
+    if(_h){holdings=_h.holdings||[];alloc=_h.alloc||null;bond=_h.bond||null;ratings=_h.ratings||[];S.set(_sbHoldKey,{holdings,alloc,bond,ratings,ts:nowPT(),tsEpoch:Date.now()});}
   }else{const _hc=S.get(_sbHoldKey);if(_hc){holdings=_hc.holdings||[];alloc=_hc.alloc||null;bond=_hc.bond||null;ratings=_hc.ratings||[];}}
 
   // Persist cache
   S.set('etf_research_'+ticker,{
     snap,fundName,fundDesc,
     hist:hist6mo?{timestamps:hist6mo.timestamps.map(d=>d instanceof Date?d.toISOString():d),closes:hist6mo.closes}:null,
-    distributions,trailingYield,ts:nowPT()
+    distributions,trailingYield,ts:nowPT(),tsEpoch:Date.now()
   });
 
   return{snap,hist6mo,distributions,trailingYield,fundName,fundDesc,holdings,alloc,bond,ratings};
@@ -594,7 +600,7 @@ function _sbBuildTile(ticker,snap,hist6mo,distributions,trailingYield,isLive,fun
       <div class="metric-tile" id="sb-total-ret-${ticker}">
         ${totalRetPct!=null?`<div class="metric-label">Total Return (6M)</div>
         <div class="metric-value" style="color:${totalRetPct>=0?'var(--green)':'var(--red)'}">${totalRetPct>=0?'+':''}${totalRetPct.toFixed(1)}%</div>
-        <div class="metric-sub">Price + distributions reinvested</div>`:''}
+        <div class="metric-sub">Price + cash distributions added (not compounded reinvestment)</div>`:''}
       </div>
       <div class="metric-tile">
         <div class="metric-label">Annualized Yield (indicated)</div>
@@ -662,7 +668,7 @@ function _updateSbReturnTiles(ticker,priceRetPct,totalRetPct,span){
     trEl.innerHTML='<div class="metric-label">Total Return ('+span+')</div>'+
       '<div class="metric-value" style="color:'+(totalRetPct>=0?'var(--green)':'var(--red)')+'">'+
         (totalRetPct>=0?'+':'')+totalRetPct.toFixed(1)+'%</div>'+
-      '<div class="metric-sub">Price + distributions reinvested</div>';
+      '<div class="metric-sub">Price + cash distributions added (not compounded reinvestment)</div>';
   }
 }
 
