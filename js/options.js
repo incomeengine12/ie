@@ -205,6 +205,8 @@ function updateSlider(id){
 
 function clearOptionsState(){
   document.getElementById('exp-section').style.display='none';
+  const freshness=document.getElementById('options-freshness-container');if(freshness)freshness.innerHTML='';
+  _optionsFreshnessFailures=[];
   document.getElementById('options-content').innerHTML='';
   document.getElementById('options-earnings-warn').innerHTML='';
   document.getElementById('oi-chart-section').style.display='none';
@@ -225,6 +227,49 @@ function setMode(mode){
   if(currentOptionsData&&lastOptionsTickerLoaded&&optSel===lastOptionsTickerLoaded){
     buildOptionsTable();
   }
+}
+
+let _optionsFreshnessFailures=[];
+// Build 538: presentation only. Never treat a fetch timestamp as a quote timestamp.
+function _optionsFreshnessModel(t,expirations){
+  const rows=expirations.slice().sort().map(date=>{
+    const cache=S.get('options_exp_'+t+'_'+date);
+    const epoch=_recEpoch(cache);
+    return {date,ts:cache?.ts||'',epoch,age:epoch==null?'--':relAge('',epoch)};
+  });
+  const metadata=S.get('options_'+t);
+  const snap=S.get('snap_'+t);
+  return {rows,metadata:{ts:metadata?.ts||'',epoch:_recEpoch(metadata)},price:{ts:snap?.ts||'',epoch:_recEpoch(snap)}};
+}
+function _optionsFreshnessHtml(model,failures=[]){
+  const shortDate=d=>{const parts=d.split('-');const m=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][Number(parts[1])-1]||'--';return m+' '+Number(parts[2]);};
+  const summary=model.rows.map(r=>shortDate(r.date)+': '+r.age).join(' · ')||'No cached chains';
+  const time=(r)=>r.epoch==null?'--':_escHtml(r.ts||new Date(r.epoch).toLocaleString());
+  const line=(label,rec)=>'<div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:5px 0"><span style="color:var(--text3)">'+_escHtml(label)+'</span><span>'+time(rec)+'</span></div>';
+  return '<details id="options-freshness" style="font-family:var(--mono);font-size:10px;color:var(--text2);margin:0 0 9px">'
+    +'<summary style="cursor:pointer;line-height:1.6;overflow-wrap:anywhere;color:var(--text3)">Fetched · '+_escHtml(summary)+'</summary>'
+    +'<div style="padding:8px 10px;margin-top:5px;border:1px solid var(--border);border-radius:7px">'
+    +(failures.length?'<div style="color:var(--warn);margin-bottom:8px">Refresh unsuccessful for '+_escHtml(failures.join(', '))+'. Previously cached chains retained where available.</div>':'')
+    +model.rows.map(r=>line(r.date,r)).join('')
+    +line('Expiration metadata',model.metadata)+line('Underlying price',model.price)
+    +'<div style="color:var(--text3);margin-top:8px;line-height:1.5">Fetched times show when Income Engine received data, not when Yahoo updated individual option quotes. Missing timestamps are shown as --.</div>'
+    +'</div></details>';
+}
+function _renderOptionsFreshness(t,expirations,failures=[]){
+  const el=document.getElementById('options-freshness-container');
+  if(el)el.innerHTML=_optionsFreshnessHtml(_optionsFreshnessModel(t,expirations),failures);
+}
+
+// Refresh presentation from existing cache only. In particular, a Ticker-tab
+// manual refresh can update these records without changing the Options ticker.
+function _syncOptionsFreshness(){
+  const selected=document.getElementById('options-ticker-select')?.value||'';
+  const el=document.getElementById('options-freshness-container');
+  if(!el||!selected||selected!==lastOptionsTickerLoaded||!currentExpirations.length)return;
+  const wasOpen=!!el.querySelector('details')?.open;
+  _renderOptionsFreshness(selected,currentExpirations,_optionsFreshnessFailures);
+  const details=el.querySelector('details');
+  if(details)details.open=wasOpen;
 }
 
 function toggleExp(e){
@@ -257,6 +302,7 @@ function saveOptionsPrefs(){
 
 async function loadOptionsForTicker(){
   const t=document.getElementById('options-ticker-select').value;if(!t){clearOptionsState();return;}
+  _optionsFreshnessFailures=[];
   _pruneExpiredOptionExpiries(t);
   // Repair: clear any synthetic per-expiry cache written outside the live window
   // so stale synthetic data doesn't display as real data
@@ -342,22 +388,11 @@ async function loadOptionsForTicker(){
     // Yahoo is strict about timestamp matching -- using a converted date string
     // causes empty options arrays to be returned.
     const rawExpTimestamps=yr?.expirationDates||[];
-    const allExpPairs=rawExpTimestamps.map(ts=>({
-      ts,
-      date:new Date(ts*1000).toISOString().split('T')[0]
-    }));
-    // Prefer standard monthly expirations (3rd Fri/Thu, 15th-21st)
-    let monthlyPairs=allExpPairs.filter(p=>{const d=new Date(p.date+'T12:00:00Z');return(d.getUTCDay()===5||d.getUTCDay()===4)&&d.getUTCDate()>=15&&d.getUTCDate()<=21;}).sort((a,b)=>a.date.localeCompare(b.date)).slice(0,3);
-    if(monthlyPairs.length===0){
-      const twoWeeksOut=Date.now()+14*86400000;
-      monthlyPairs=allExpPairs.filter(p=>p.ts*1000>=twoWeeksOut).sort((a,b)=>a.date.localeCompare(b.date)).slice(0,3);
-      if(monthlyPairs.length===0)monthlyPairs=allExpPairs.sort((a,b)=>a.date.localeCompare(b.date)).slice(0,3);
-    }
-    const monthly=monthlyPairs.map(p=>p.date);
-    currentExpirations=monthly;selectedExpirations=[...monthly];
+    const monthlyPairs=_futureMonthlyOptionPairs(rawExpTimestamps);
     _pruneExpiredOptionExpiries(t);
     // Per-expiry chains only when we actually fetched the main chain live.
     // Cache-served navigations skip this block entirely -- no network calls.
+    const _failedExpirations=[];
     if(_fetchedLive){
       await Promise.all(monthlyPairs.map(async pair=>{
         const _expKey='options_exp_'+t+'_'+pair.date;
@@ -370,14 +405,23 @@ async function loadOptionsForTicker(){
             if(_slimmed)S.set(_expKey,{..._slimmed,ts:nowPT(),tsEpoch:Date.now()});
             if(S.get('debug_options_fetch')==='true')toast(t+' '+pair.date+': exp fetch valid -- wrote fresh',4000);
           }else{
+            _failedExpirations.push(pair.date);
             const _existing=S.get(_expKey);
             const ok=_existing&&!_existing.synthetic;
             if(!ok){const _s=slimExpData(ed);if(_s)S.set(_expKey,{..._s,ts:nowPT(),tsEpoch:Date.now(),synthetic:true});if(S.get('debug_options_fetch')==='true')toast(t+' '+pair.date+': exp INVALID ('+_expVal.reason+') no prior cache -- wrote synthetic',5000);}
             else{if(S.get('debug_options_fetch')==='true')toast(t+' '+pair.date+': exp INVALID ('+_expVal.reason+') -- kept stale cache',5000);console.warn(t+' '+pair.date+': rejecting fresh fetch ('+_expVal.reason+'), preserving cache from '+(_existing?.ts||'unknown ts'));}
           }
-        }catch(e){if(S.get('debug_options_fetch')==='true')toast(t+' '+pair.date+': exp fetch ERROR: '+(e?.message||'unknown'),5000);console.warn(t+' '+pair.date+': exp fetch error',e?.message);}
+        }catch(e){_failedExpirations.push(pair.date);if(S.get('debug_options_fetch')==='true')toast(t+' '+pair.date+': exp fetch ERROR: '+(e?.message||'unknown'),5000);console.warn(t+' '+pair.date+': exp fetch error',e?.message);}
       }));
     }
+    // Show only future expirations with real, usable cached chains. An absent
+    // January chain must not displace good November/December chains or produce
+    // an empty button. Invalid/synthetic refreshes never qualify.
+    const monthly=monthlyPairs.map(p=>p.date).filter(e=>{
+      const entry=S.get('options_exp_'+t+'_'+e);
+      return entry&&!entry.synthetic&&(_expPuts(entry).length>0||_expCalls(entry).length>0);
+    });
+    currentExpirations=monthly;selectedExpirations=[...monthly];
     const chipsEl=document.getElementById('exp-chips');
     chipsEl.innerHTML=monthly.map(e=>{
       const _ec=S.get('options_exp_'+t+'_'+e);
@@ -386,8 +430,15 @@ async function loadOptionsForTicker(){
       const _ecTitle=_ecTs?('Cached '+_ecTs+(_ecAge?' ('+_ecAge+')':'')):'No timestamp (legacy cache)';
       return`<div class="exp-chip selected" id="chip-${e}" onclick="toggleExp('${e}')" title="${_ecTitle}">${e}</div>`;
     }).join('');
-    document.getElementById('exp-section').style.display='block';
+    document.getElementById('exp-section').style.display=monthly.length?'block':'none';
+    _optionsFreshnessFailures=_failedExpirations;
+    _renderOptionsFreshness(t,monthly,_failedExpirations);
     loadOptionsPrefs();
+    if(!monthly.length){
+      document.getElementById('options-content').innerHTML='<div class="card"><div class="empty">No valid future options chains cached. Try refreshing when market data is available.</div></div>';
+      document.getElementById('oi-chart-section').style.display='none';
+      return;
+    }
     // Check for OI data availability -- show amber box if missing. Uses
     // the per-expiration cache for the nearest just-fetched monthly date
     // directly (monthly[0]), rather than yr's own embedded data -- the

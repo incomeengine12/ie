@@ -14,12 +14,50 @@ function setDashboardViewMode(mode){
   _syncDashboardViewModeUI();
 }
 
+// Counts active ITM positions approaching expiration across every income account.
+// Reuses the same status and pricing decisions as the Income tab and ITM Risk view.
+function _dashboardITMExpiryAlert(){
+  const result={soon:0,imminent:0};
+  const accounts=S.get('income_accounts_meta')||[];
+  for(const acct of accounts){
+    for(const [suffix,isCall] of [['put_positions',false],['cc_positions',true]]){
+      for(const pos of S.get('income_'+acct.id+'_'+suffix)||[]){
+        try{
+          const status=_posExpiryStatus(pos);
+          if(status!=='expiring-soon'&&status!=='expiring-imminent')continue;
+          const pricing=_getPosPricing(pos,isCall);
+          if(pricing.currentPrice==null||!Number.isFinite(Number(pricing.currentPrice))||Number(pricing.currentPrice)<=0||pricing.itm!==true)continue;
+          if(status==='expiring-imminent')result.imminent++;
+          else result.soon++;
+        }catch{} // A malformed record must not prevent the other accounts from rendering.
+      }
+    }
+  }
+  return result;
+}
+
+function _renderDashboardITMExpiryAlert(){
+  const badge=document.getElementById('dash-risk-expiry-alert');
+  if(!badge)return;
+  const {soon,imminent}=_dashboardITMExpiryAlert();
+  const count=soon+imminent;
+  badge.style.display=count?'inline-flex':'none';
+  badge.textContent=count?String(count):'';
+  badge.style.background=imminent?'var(--red)':'var(--warn)';
+  badge.style.color=imminent?'#fff':'#111';
+  badge.title=imminent
+    ?`${count} active ITM position(s) expiring within 7 days; ${imminent} within 2 days`
+    :count?`${count} active ITM position(s) expiring within 7 days`:'';
+  badge.setAttribute('aria-label',badge.title);
+}
+
 function _syncDashboardViewModeUI(){
   const putsBtn=document.getElementById('dash-view-puts'),ccBtn=document.getElementById('dash-view-cc'),rsiBtn=document.getElementById('dash-view-rsi'),riskBtn=document.getElementById('dash-view-risk'),gapBtn=document.getElementById('dash-view-gap'),notesBtn=document.getElementById('dash-view-notes'),wheelbtBtn=document.getElementById('dash-view-wheelbt'),valuationBtn=document.getElementById('dash-view-valuation');
   if(putsBtn)putsBtn.style.opacity=dashboardViewMode==='puts'?'1':'0.4';
   if(ccBtn)ccBtn.style.opacity=dashboardViewMode==='cc'?'1':'0.4';
   if(rsiBtn)rsiBtn.style.opacity=dashboardViewMode==='rsi'?'1':'0.4';
   if(riskBtn)riskBtn.style.opacity=dashboardViewMode==='risk'?'1':'0.4';
+  _renderDashboardITMExpiryAlert();
   if(gapBtn)gapBtn.style.opacity=dashboardViewMode==='gap'?'1':'0.4';
   if(notesBtn)notesBtn.style.opacity=dashboardViewMode==='notes'?'1':'0.4';
   if(wheelbtBtn)wheelbtBtn.style.opacity=dashboardViewMode==='wheelbt'?'1':'0.4';
@@ -421,11 +459,7 @@ function renderAssignmentRisk(){
   const content=document.getElementById('assignment-risk-content');
   if(!content)return;
   const rows=_computeAssignmentRisk();
-  if(!rows.length){
-    content.innerHTML='<div class="empty"><div class="empty-icon">&#x1F4CA;</div>No positions currently ITM</div>';
-    return;
-  }
-  content.innerHTML=rows.map(r=>{
+  const itmHtml=rows.length?rows.map(r=>{
     const kindLabel=r.isCall?'Call':'Put';
     const urgentColor=r.daysToExpiry<=7?'var(--red)':r.daysToExpiry<=21?'var(--warn)':'var(--text2)';
     const tvStr=r.timeValue!=null?'$'+r.timeValue.toFixed(0):'--';
@@ -445,7 +479,36 @@ function renderAssignmentRisk(){
       </div>
       ${earningsStr?`<div style="font-family:var(--mono);font-size:10px;margin-top:2px">${earningsStr}</div>`:''}
     </div>`;
-  }).join('');
+  }).join(''):'<div class="empty">No positions currently ITM</div>';
+  const threshold=Number(S.get('risk_proximity_pct'))||2;
+  const nearby=_computeApproachingStrike(threshold);
+  const controls='<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">'
+    +'<span style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--warn)">Approaching Strike ('+nearby.length+')</span>'
+    +'<label style="font-family:var(--mono);font-size:10px;color:var(--text3)">Within <select class="input" style="font-size:11px;padding:3px" onchange="setRiskProximityThreshold(this.value)">'
+    +[1,2,3,5].map(n=>'<option value="'+n+'"'+(n===threshold?' selected':'')+'>'+n+'%</option>').join('')+'</select></label></div>';
+  const nearHtml=nearby.length?nearby.map(r=>{
+    const kind=r.isCall?'Call':'Put';
+    const urgency=r.daysToExpiry<=2?'var(--warn)':'var(--text3)';
+    return `<div style="padding:8px 0;border-bottom:1px solid var(--surface3)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-family:var(--mono);font-size:12px;font-weight:600;cursor:pointer" onclick="navigateToTicker('${r.ticker}')">${r.ticker}</span>
+        <span style="font-family:var(--mono);font-size:9px;color:var(--text3);cursor:pointer;text-decoration:underline" onclick="navigateToAccount('${r.accountId}')">${r.accountName}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;margin-top:3px">
+        <span style="color:var(--text2)">${kind} $${formatStrike(r.strike)} vs $${r.currentPrice.toFixed(2)}</span>
+        <span style="color:var(--warn);font-weight:600">${r.distancePct.toFixed(1)}% OTM</span>
+      </div>
+      <div style="font-family:var(--mono);font-size:10px;color:${urgency};margin-top:2px">${r.daysToExpiry===0?'Expires today':r.daysToExpiry+'d to expiry'}</div>
+    </div>`;
+  }).join(''):'<div class="empty">No active OTM positions within '+threshold+'% of their strike</div>';
+  content.innerHTML=itmHtml+'<div style="border-top:1px solid var(--border);margin:18px 0 12px;padding-top:14px">'
+    +controls+'<div style="font-family:var(--mono);font-size:10px;color:var(--text3);margin-bottom:8px">Active OTM positions · soonest expiry first, then closest strike. Based on cached prices.</div>'
+    +nearHtml+'</div>';
+}
+
+function setRiskProximityThreshold(value){
+  if(!['1','2','3','5'].includes(String(value)))return;
+  if(S.set('risk_proximity_pct',String(value)))renderAssignmentRisk();
 }
 
 // ── Valuation view (sector-grouped P/E & PEG comparison) ────────────────────
